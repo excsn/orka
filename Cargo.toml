@@ -1,0 +1,16 @@
+[workspace]
+members = [
+  "core",
+  "examples/ecommerce_app",
+]
+resolver = "2"
+
+# Optional: Default settings for all workspace members
+# [workspace.dependencies]
+# anyhow = "1.0"
+# tokio = { version = "1", features = ["full"] }
+# tracing = "0.1"
+# thiserror = "1.0"
+# etc.
+# If you define common dependencies here, member crates can inherit them
+# by specifying `dep_name = { workspace = true }` in their own Cargo.toml
