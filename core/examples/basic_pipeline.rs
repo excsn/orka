@@ -1,6 +1,6 @@
 // orka_core/examples/basic_pipeline.rs
 
-use orka::{ContextData, OrkaError, Pipeline, PipelineControl, PipelineResult};
+use orka::{ContextData, OrkaError, OrkaResult, Pipeline, PipelineControl, PipelineResult};
 use tracing::info;
 
 // 1. Define the Context Data for the pipeline
@@ -39,7 +39,7 @@ async fn main() -> Result<(), OrkaError> {
       let msg = format!("Alpha executed: counter = {}", data.counter);
       info!("{}", msg);
       data.message_log.push(msg);
-      Ok::<_, OrkaError>(PipelineControl::Continue) // Use Ok without explicit type if Err can be inferred
+      OrkaResult::<_>::Ok(PipelineControl::Continue)
     })
   });
 

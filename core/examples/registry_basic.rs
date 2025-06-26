@@ -1,6 +1,6 @@
 // orka_core/examples/registry_basic.rs
 
-use orka::{ContextData, Orka, OrkaError, Pipeline, PipelineControl, PipelineResult};
+use orka::{ContextData, Orka, OrkaError, OrkaResult, Pipeline, PipelineControl, PipelineResult};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       let msg = format!("User Action Processed for: {}", data.user_id);
       info!("{}", msg);
       data.action_log.push(msg);
-      Ok::<_, RegistryExampleError>(PipelineControl::Continue)
+      OrkaResult::<_>::Ok(PipelineControl::Continue)
     })
   });
   orka_registry.register_pipeline(user_pipeline);
