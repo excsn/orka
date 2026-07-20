@@ -1,5 +1,3 @@
-// orka/src/conditional/mod.rs
-
 //! Enables conditional execution of scoped pipelines within a step of a main pipeline.
 //!
 //! This module provides the `ConditionalScopeBuilder` for a fluent API to define

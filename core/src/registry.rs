@@ -1,5 +1,3 @@
-// orka/src/registry.rs
-
 //! Defines the `Orka<E>` struct, a type-keyed registry for managing and executing pipelines.
 //! Pipelines are `crate::pipeline::definition::Pipeline<TData, PipelineHandlerError>`.
 //! The registry returns results with an application-level error type `E`.
@@ -10,11 +8,13 @@ use crate::error::OrkaError; // Orka's own error type
 // Explicitly import the main Pipeline definition
 use crate::pipeline::definition::Pipeline as CorePipeline;
 
+use crate::error::OrkaResult;
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tracing::{event, instrument, Level};
 
 /// Type-erased trait for pipeline execution by the registry.
@@ -117,10 +117,19 @@ where
   ///
   /// - `PipelineHandlerError` (used by the pipeline's handlers) must be `From<OrkaError>`.
   /// - `ApplicationError` (this registry's error type) must be `From<PipelineHandlerError>`.
+  ///
+  /// The pipeline is [`validate`](CorePipeline::validate)d first, so setup mistakes surface
+  /// here rather than on the first run.
+  ///
+  /// Pipelines are keyed by `TData`, so registering a second pipeline for the same context
+  /// type replaces the first.
+  ///
+  /// # Errors
+  /// Returns [`OrkaError::ConfigurationError`] if the pipeline fails validation.
   pub fn register_pipeline<TData, PipelineHandlerError>(
     &self,
     pipeline: CorePipeline<TData, PipelineHandlerError>,
-  )
+  ) -> OrkaResult<()>
   where
     TData: 'static + Send + Sync,
     PipelineHandlerError: std::error::Error + From<OrkaError> + Send + Sync + 'static, // Bound for Pipeline::run
@@ -128,6 +137,9 @@ where
     CorePipeline<TData, PipelineHandlerError>: Send + Sync,
   {
     event!(Level::DEBUG, tdata_type = %std::any::type_name::<TData>(), pipeline_handler_error = %std::any::type_name::<PipelineHandlerError>(), "Registering pipeline.");
+
+    pipeline.validate()?;
+
     let wrapper = PipelineWrapper::<TData, PipelineHandlerError, ApplicationError> {
       pipeline: Arc::new(pipeline),
       _phantom_tdata: PhantomData,
@@ -137,8 +149,9 @@ where
     self
       .registry
       .lock()
-      .unwrap()
       .insert(TypeId::of::<TData>(), Arc::new(wrapper)); // Keyed by TData
+
+    Ok(())
   }
 
   /// Runs the pipeline registered for the underlying data type `TData`.
@@ -151,7 +164,7 @@ where
 
     let runner_arc: Arc<dyn AnyPipelineRunner<ApplicationError>>;
     {
-      let reg_lock = self.registry.lock().unwrap();
+      let reg_lock = self.registry.lock();
       runner_arc = reg_lock
         .get(&type_id)
         .cloned()
@@ -172,7 +185,18 @@ where
   }
 }
 
+impl<ApplicationError> Default for Orka<ApplicationError>
+where
+  ApplicationError: std::error::Error + From<OrkaError> + Send + Sync + 'static,
+{
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl Orka<OrkaError> {
+  /// Convenience constructor for the common case where `OrkaError` is also the application
+  /// error type.
   pub fn new_default() -> Self {
     Orka::<OrkaError>::new()
   }

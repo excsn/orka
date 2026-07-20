@@ -1,5 +1,3 @@
-// orka_project/examples/ecommerce_app/src/services/auth_service.rs
-
 //! Provides authentication-related services like password hashing and verification.
 
 use crate::errors::AppError; // Application-specific error type

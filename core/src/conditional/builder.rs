@@ -1,17 +1,15 @@
-// orka/src/conditional/builder.rs
-
 //! Implements the fluent builder API (`ConditionalScopeBuilder`, `ConditionalScopeConfigurator`)
 //! for defining conditional execution of scoped pipelines within a main pipeline step.
 //! The main pipeline is `Pipeline<TData, Err>` and its handlers return `Result<_, Err>`.
 //! Scoped pipelines provided are now also `Pipeline<SData, Err>`.
 
 use crate::conditional::provider::{FunctionalPipelineProvider, PipelineProvider, StaticPipelineProvider};
-use crate::conditional::scope::{AnyConditionalScope, ConditionalScope}; // Now AnyConditionalScope<TData, Err>
-use crate::core::context::Handler;
+use crate::conditional::scope::{AnyConditionalScope, ConditionalScope};
+use crate::core::context::{ExtractorFn, Handler, MergeFn};
 use crate::core::context_data::ContextData;
 use crate::core::control::PipelineControl;
-use crate::error::{OrkaError, OrkaResult}; // OrkaResult is Result<_, OrkaError>, used by extractor
-use crate::pipeline::Pipeline; // Pipeline<TData, Err> or Pipeline<SData, Err>
+use crate::error::OrkaError;
+use crate::pipeline::Pipeline;
 
 use std::future::Future;
 use std::marker::PhantomData;
@@ -23,6 +21,7 @@ use tracing::{event, instrument, Level};
 /// `TData` is the underlying data type of the main pipeline's context.
 /// `Err` is the error type returned by the main pipeline's handlers AND by the scoped pipelines.
 /// `Err` must be constructible `From<OrkaError>` to handle framework-level errors (e.g., extractor failure).
+#[must_use = "conditional scopes are only applied when you call .finalize_conditional_step()"]
 pub struct ConditionalScopeBuilder<'pipeline, TData, Err>
 where
   TData: 'static + Send + Sync,
@@ -50,6 +49,9 @@ where
         skip_if: None,
       });
     }
+    // Cleared again by `finalize_conditional_step`; anything left here is reported by
+    // `Pipeline::validate` as a scope configuration that was silently discarded.
+    pipeline.pending_conditional.insert(step_name.clone());
     Self {
       pipeline,
       step_name,
@@ -75,6 +77,7 @@ where
       builder: self,
       provider: Arc::new(StaticPipelineProvider::new(static_pipeline)),
       extractor: Arc::new(extractor_fn),
+      merge: None,
       _phantom_sdata: PhantomData,
     }
   }
@@ -99,6 +102,7 @@ where
       builder: self,
       provider: Arc::new(FunctionalPipelineProvider::new(pipeline_factory)),
       extractor: Arc::new(extractor_fn),
+      merge: None,
       _phantom_sdata: PhantomData,
     }
   }
@@ -115,8 +119,7 @@ where
     )]
   pub fn finalize_conditional_step(self, optional_for_main_step: bool) {
     let step_name_captured = self.step_name.clone();
-    let collected_scopes_for_config = Arc::new(self.collected_scopes); // Vec<Arc<dyn AnyConditionalScope<TData, Err>>>
-    let scopes_for_closure_capture = collected_scopes_for_config.clone();
+    let scopes_for_closure_capture = Arc::new(self.collected_scopes); // Vec<Arc<dyn AnyConditionalScope<TData, Err>>>
     let on_no_match_behavior_captured = self.on_no_match_behavior;
 
     // The master handler is Handler<TData, Err> for the main pipeline.
@@ -162,17 +165,17 @@ where
       event!(Level::WARN, step_name = %self.step_name, "Step definition not found during finalize_conditional_step. This may indicate an internal issue.");
     }
 
-    // Store the collected scopes (Arc<Vec<Arc<dyn AnyConditionalScope<TData, Err>>>>)
-    // and no-match behavior in the pipeline's config.
-    let mut config_map_locked = self.pipeline.conditional_scopes_config.lock().unwrap();
-    config_map_locked.insert(
-      self.step_name.clone(),
-      (collected_scopes_for_config, on_no_match_behavior_captured),
-    );
-    drop(config_map_locked);
+    // This step is now properly configured; drop it from the "never finalized" set.
+    self.pipeline.pending_conditional.remove(&self.step_name);
 
-    // Register the master handler for the 'on' phase of this step.
-    self.pipeline.on.insert(self.step_name.clone(), vec![master_handler]);
+    // Append (do NOT replace) the master handler for the 'on' phase of this step, so
+    // conditional scopes compose with any `on_root` handlers already registered here.
+    self
+      .pipeline
+      .on
+      .entry(self.step_name.clone())
+      .or_default()
+      .push(master_handler);
 
     event!(Level::INFO, step_name = %self.step_name, "Conditional scopes finalized and master handler registered.");
   }
@@ -183,6 +186,7 @@ where
 /// `SData`: Scoped pipeline's underlying context data type. Must be `Send + Sync + 'static`.
 /// `Err`: Error type of the main pipeline AND scoped pipelines. Must be `From<OrkaError>`.
 /// `P`: Concrete `PipelineProvider<TData, SData, Err>` (provides `Pipeline<SData, Err>`).
+#[must_use = "this scope is only registered when you call .on_condition(), and applied when you call .finalize_conditional_step()"]
 pub struct ConditionalScopeConfigurator<
   'pipeline,
   TData: 'static + Send + Sync,
@@ -192,8 +196,8 @@ pub struct ConditionalScopeConfigurator<
 > {
   builder: ConditionalScopeBuilder<'pipeline, TData, Err>,
   provider: Arc<P>,
-  // extractor_fn returns Result<ContextData<SData>, OrkaError>
-  extractor: Arc<dyn Fn(ContextData<TData>) -> Result<ContextData<SData>, OrkaError> + Send + Sync + 'static>,
+  extractor: ExtractorFn<TData, SData>,
+  merge: Option<MergeFn<TData, SData>>,
   _phantom_sdata: PhantomData<SData>, // To mark usage of SData
 }
 
@@ -204,6 +208,28 @@ where
   Err: std::error::Error + From<OrkaError> + Send + Sync + 'static,
   P: PipelineProvider<TData, SData, Err> + 'static,
 {
+  /// Folds this scope's context back into the main context after the scoped pipeline
+  /// completes successfully.
+  ///
+  /// Without this, a scope is detached: the scoped pipeline works on its own `ContextData<SData>`
+  /// and the main context sees nothing of what it did. With it, results land in the parent:
+  ///
+  /// ```ignore
+  /// pipeline
+  ///   .conditional_scopes_for_step("pay")
+  ///   .add_static_scope(provider_a, |main| Ok(main.project(|d| d.payment.clone())))
+  ///   .with_merge(|main, sub| main.payment = sub.clone())
+  ///   .on_condition(|main| main.read().provider == Provider::A)
+  ///   .finalize_conditional_step(false);
+  /// ```
+  ///
+  /// The merge runs **only when the scoped pipeline succeeds** — a failed scope leaves the
+  /// main context untouched.
+  pub fn with_merge(mut self, merge_fn: impl Fn(&mut TData, &SData) + Send + Sync + 'static) -> Self {
+    self.merge = Some(Arc::new(merge_fn));
+    self
+  }
+
   /// Sets the condition for this scope. `condition_fn` takes `ContextData<TData>`.
   /// Returns `ConditionalScopeBuilder<TData, Err>`.
   #[instrument(
@@ -220,6 +246,7 @@ where
       pipeline_provider: self.provider, // This is Arc<dyn PipelineProvider<TData, SData, Err>>
       extractor: self.extractor,
       condition: Arc::new(condition_fn),
+      merge: self.merge,
       _phantom_main_err: PhantomData, // From ConditionalScope struct
     };
 

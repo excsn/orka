@@ -1,4 +1,3 @@
-// core/src/core/context_data.rs (or wherever you place it)
 use parking_lot::{
   MappedRwLockReadGuard,
   MappedRwLockWriteGuard, // Useful for "extracting" parts
@@ -59,6 +58,34 @@ impl<T: Send + Sync + 'static> ContextData<T> {
     F: FnOnce(&mut T) -> &mut U,
   {
     RwLockWriteGuard::map(self.write(), f)
+  }
+
+  /// Builds a *new, independent* `ContextData<U>` from a projection of this one.
+  ///
+  /// This is the common shape of a sub-context extractor: take a read lock, pull out
+  /// (usually clone) the part a scoped pipeline cares about, and hand it over as its
+  /// own context.
+  ///
+  /// ```ignore
+  /// pipeline.set_extractor("validate", |main| Ok(main.project(|d| d.customer.clone())));
+  /// ```
+  ///
+  /// The result does **not** share state with `self` — writes to it are not visible here.
+  /// To propagate them back, pair the extractor with a merge function via
+  /// [`Pipeline::set_extractor_with_merge`](crate::Pipeline::set_extractor_with_merge).
+  ///
+  /// The read guard is released before this returns, so the result is safe to hold
+  /// across an `.await`.
+  pub fn project<U, F>(&self, get: F) -> ContextData<U>
+  where
+    U: Send + Sync + 'static,
+    F: FnOnce(&T) -> U,
+  {
+    let projected = {
+      let guard = self.read();
+      get(&*guard)
+    };
+    ContextData::new(projected)
   }
 }
 

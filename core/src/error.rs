@@ -1,4 +1,3 @@
-// orka_core/src/error.rs
 use anyhow::Error as AnyhowError;
 use thiserror::Error;
 
@@ -47,22 +46,12 @@ pub enum OrkaError {
 }
 
 // This is the key conversion Orka provides for external errors.
+//
+// An `anyhow::Error` that already wraps an `OrkaError` is deliberately left nested rather
+// than unwrapped: `OrkaError` is not `Clone`, and `HandlerError` keeps the original as a
+// `#[source]`, so the causal chain stays intact either way.
 impl From<AnyhowError> for OrkaError {
   fn from(err: AnyhowError) -> Self {
-    // Check if the anyhow::Error is already wrapping an OrkaError
-    // to avoid OrkaError(HandlerError(OrkaError(...)))
-    if let Some(orka_err) = err.downcast_ref::<OrkaError>() {
-        // This requires OrkaError to be Clone, or to reconstruct.
-        // For now, let's assume we want to avoid direct cloning if not necessary
-        // and just re-wrap for simplicity, or handle specific variants.
-        // A simple re-wrap:
-        // return OrkaError::HandlerError { source: err }; // This might be fine.
-
-        // If OrkaError is not Clone, we can't just return *orka_err.
-        // A common pattern is to stringify and wrap in Internal, or just re-wrap as HandlerError.
-        // Given HandlerError takes anyhow::Error, simply returning it is often best.
-        return OrkaError::HandlerError { source: err };
-    }
     OrkaError::HandlerError { source: err }
   }
 }

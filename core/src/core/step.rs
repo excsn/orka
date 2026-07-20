@@ -1,5 +1,3 @@
-// orka/src/core/step.rs
-
 //! Defines the structure for a single step within a pipeline.
 
 use super::ContextData;

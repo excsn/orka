@@ -1,30 +1,25 @@
-// orka_project/examples/ecommerce_app/src/config.rs
-
-use crate::errors::{AppError, Result}; // Use AppError specific Result
+use crate::errors::{AppError, Result};
 use dotenvy::dotenv;
 use std::env;
 
-#[derive(Debug, Clone)] // Clone is useful if parts of config are passed around
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // app_base_url is loaded for completeness; no route needs it yet.
 pub struct AppConfig {
   pub server_host: String,
   pub server_port: u16,
   pub database_url: String,
   pub app_base_url: String,
 
-  // Example mock payment config
   pub mock_payment_provider_main_id: String,
   pub mock_payment_provider_alt_id: String,
-
-  // Example mock email config
   pub mock_email_sender: String,
 
-  // Optional: for seeding DB on startup
   pub seed_db: bool,
 }
 
 impl AppConfig {
   pub fn from_env() -> Result<Self> {
-    dotenv().ok(); // Load .env file if present
+    dotenv().ok();
 
     let get_env = |var_name: &str| {
       env::var(var_name).map_err(|e| AppError::Config(format!("Missing environment variable '{}': {}", var_name, e)))
@@ -49,8 +44,6 @@ impl AppConfig {
       .map_err(|e| AppError::Config(format!("Invalid SEED_DB value: {}", e)))?;
 
     tracing::info!("Application configuration loaded successfully.");
-    // Avoid logging secrets in production directly, or use redacted logging.
-    // tracing::debug!(config = ?Self { database_url: "[REDACTED]".to_string(), .. }, "Loaded config details");
 
     Ok(Self {
       server_host,

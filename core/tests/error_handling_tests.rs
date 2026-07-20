@@ -1,14 +1,13 @@
-// tests/error_handling_tests.rs
 mod common;
 use common::*;
-use orka::{ContextData, OrkaError, Pipeline, PipelineControl, PipelineResult};
+use orka::{ContextData, OrkaError, Pipeline, PipelineControl};
 use serial_test::serial;
 
 #[tokio::test]
 #[serial]
 async fn test_pipeline_run_catches_handler_missing() {
   setup_tracing();
-  let pipeline = Pipeline::<TestContext, TestError>::new(&[("missing", false, None)]);
+  let pipeline = Pipeline::<TestContext, TestError>::new(["missing"]);
   let ctx = ContextData::new(TestContext::default());
   let result = pipeline.run(ctx).await;
   assert!(result.is_err());
@@ -21,24 +20,18 @@ async fn test_pipeline_run_catches_handler_missing() {
   }
 }
 
-// Test specific OrkaError variants from conditional logic (extractor/provider failures)
-// are already covered in conditional_scope_tests.rs because TestError::Orka wraps the
-// formatted OrkaError string.
+// Extractor and provider failure variants are covered in conditional_scope_tests.rs.
 
-// Test a pipeline whose error type IS OrkaError.
+/// A pipeline whose handler error type is `OrkaError` itself — the zero-friction path.
 #[tokio::test]
 #[serial]
 async fn test_pipeline_with_orka_error_type() {
   setup_tracing();
-  let mut pipeline = Pipeline::<TestContext, OrkaError>::new(&[("task", false, None)]);
+  let mut pipeline = Pipeline::<TestContext, OrkaError>::new(["task"]);
 
-  pipeline.on_root("task", |ctx: ContextData<TestContext>| {
-    Box::pin(async move {
-      ctx.write().counter = 1;
-      // If this handler needed to return a specific OrkaError:
-      // return Err(OrkaError::Internal("test orka error".to_string()));
-      Ok::<PipelineControl, OrkaError>(PipelineControl::Continue)
-    })
+  pipeline.on_root("task", |ctx| async move {
+    ctx.write().counter = 1;
+    Ok(PipelineControl::Continue)
   });
 
   let ctx = ContextData::new(TestContext::default());
@@ -46,10 +39,9 @@ async fn test_pipeline_with_orka_error_type() {
   assert!(result.is_ok());
   assert_eq!(ctx.read().counter, 1);
 
-  // Test failing with an OrkaError
-  let mut failing_pipeline = Pipeline::<TestContext, OrkaError>::new(&[("fail_task", false, None)]);
-  failing_pipeline.on_root("fail_task", |_ctx| {
-    Box::pin(async move { Err(OrkaError::Internal("Intentional OrkaError".to_string())) })
+  let mut failing_pipeline = Pipeline::<TestContext, OrkaError>::new(["fail_task"]);
+  failing_pipeline.on_root("fail_task", |_ctx| async move {
+    Err(OrkaError::Internal("Intentional OrkaError".to_string()))
   });
   let fail_ctx = ContextData::new(TestContext::default());
   let fail_result = failing_pipeline.run(fail_ctx).await;
@@ -58,4 +50,26 @@ async fn test_pipeline_with_orka_error_type() {
     OrkaError::Internal(s) => assert_eq!(s, "Intentional OrkaError"),
     _ => panic!("Expected OrkaError::Internal"),
   }
+}
+
+/// A handler may return any error convertible into the pipeline's `Err` via `?`.
+#[tokio::test]
+#[serial]
+async fn test_handler_converts_foreign_error_with_question_mark() {
+  setup_tracing();
+  let mut pipeline = Pipeline::<TestContext, TestError>::new(["parse"]);
+
+  pipeline.on_root("parse", |ctx| async move {
+    let parsed: i32 = "not_a_number"
+      .parse()
+      .map_err(|e| TestError::Handler(format!("parse failed: {}", e)))?;
+    ctx.write().counter = parsed;
+    Ok(PipelineControl::Continue)
+  });
+
+  let ctx = ContextData::new(TestContext::default());
+  let result = pipeline.run(ctx.clone()).await;
+
+  assert!(result.is_err());
+  assert_eq!(ctx.read().counter, 0);
 }

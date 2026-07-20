@@ -1,361 +1,387 @@
-# II. Detailed Usage and API Overview
+# Orka Usage Guide
 
-**1. Guide Introduction & Core Concepts Recap:**
+This guide walks through building workflows with Orka: defining pipelines and handlers, working on sub-contexts, branching with conditional scopes, and integrating Orka's errors with your own.
 
-*   **(a) Guide Purpose:** This guide provides a comprehensive overview of the Orka workflow engine, detailing its core concepts, API, and best practices for building robust, multi-step asynchronous processes in Rust.
-*   **(b) Table of Contents (Suggest Main Sections):**
-    1.  **Introduction to Orka**
-        *   What is Orka?
-        *   Why use a workflow engine?
-    2.  **Core Concepts**
-        *   Pipelines (`Pipeline<TData, Err>`)
-        *   Context Data (`ContextData<T>`)
-        *   Handlers (`Handler<TData, Err>`)
-        *   Steps (`StepDef<TData>`) and Execution Phases (Before, On, After)
-        *   Pipeline Control (`PipelineControl`, `PipelineResult`)
-    3.  **Getting Started: A Simple Pipeline**
-        *   Defining `TData` and `Err`
-        *   Creating a `Pipeline`
-        *   Registering Handlers (`on_root`)
-        *   Running the Pipeline
-    4.  **Advanced Pipeline Features**
-        *   Sub-Context Extraction (`set_extractor`, `on<SData>`)
-        *   Step Manipulation (Adding, Removing, Optional, Skip Conditions)
-    5.  **Conditional Execution: Branching Workflows**
-        *   Introduction to `ConditionalScopeBuilder`
-        *   Defining Scopes: Static vs. Dynamic Pipelines
-        *   Extractors and Conditions for Scopes
-        *   Scoped Pipeline Context (`SData`) and Error Handling
-        *   Finalizing Conditional Steps
-    6.  **Managing Multiple Pipelines: The Orka Registry**
-        *   The `Orka<ApplicationError>` Registry
-        *   Registering and Running Pipelines by `TData` Type
-    7.  **Error Handling in Depth**
-        *   `OrkaError` (Framework Errors)
-        *   Integrating with Application-Specific Errors (`From<OrkaError>`)
-        *   Error Propagation in Main and Scoped Pipelines
-    8.  **Best Practices & Patterns**
-        *   Managing `ContextData` Locks
-        *   Designing Idempotent Handlers (where applicable)
-        *   Structuring Complex Workflows
-    9.  **Examples** (Link to `examples/` directory)
-    10. **API Reference** (Link to `docs.rs`)
-    11. **Contributing**
-*   **(c) Core Concepts Deep Dive:**
-    *   **`Pipeline<TData, Err>`:** The fundamental building block. It encapsulates an ordered sequence of named `StepDef`s. `TData` is the shared state for the entire pipeline, wrapped in `ContextData<TData>`. `Err` is the application-defined error type for this pipeline's handlers, which must be `From<OrkaError>`. Each step can have handlers for `before`, `on` (main logic), and `after` phases.
-    *   **`ContextData<T>`:** An `Arc<RwLock<T>>` providing shared ownership and interior mutability for pipeline state. It's crucial to manage lock acquisition (`read()`, `write()`) and ensure guards are dropped before any `.await` point to prevent deadlocks. Cloning `ContextData` clones the `Arc`, allowing efficient sharing.
-    *   **`Handler<TData, Err>`:** A type alias for `Box<dyn Fn(ContextData<TData>) -> Pin<Box<dyn Future<Output = Result<PipelineControl, Err>> + Send>> + Send + Sync>`. Handlers are asynchronous, take the pipeline's context data, and return either `PipelineControl::Continue` to proceed or `PipelineControl::Stop` to halt execution, wrapped in a `Result` with the pipeline's `Err` type.
-    *   **`StepDef<TData>`:** Defines a named step, its optionality, and an optional `SkipCondition<TData>` (a closure `Fn(ContextData<TData>) -> bool`) to dynamically skip the step.
-    *   **`ConditionalScopeBuilder` & Scoped Pipelines:** This mechanism allows a single step in a main `Pipeline<TData, Err>` to conditionally execute one of several *scoped pipelines*. These scoped pipelines are themselves full `Pipeline<SData, Err>` instances (note: they now also use the main pipeline's `Err` type after our redesign). They operate on an `SData` (scoped context data) extracted from `TData`. This enables powerful dynamic workflow branching. The `PipelineProvider` trait defines how these scoped pipelines are obtained (statically or via a dynamic factory).
-    *   **`Orka<ApplicationError>` Registry:** A container for multiple `Pipeline` definitions, keyed by their `TData`'s `TypeId`. It allows an application to define various workflows and run them by providing the corresponding initial context data. `ApplicationError` is the global error type for the registry, and must be `From<OrkaError>` and also `From<PipelineHandlerError>` for any pipeline registered.
+For signature-level detail see [API_REFERENCE.md](API_REFERENCE.md). For runnable code see [`examples/`](examples).
 
-**2. Quick Start Examples (2-3 examples):**
+## Table of Contents
 
-*   **Example 1: Basic Sequential Task Pipeline**
-    *   **Use Case:** Demonstrates creating a simple pipeline with a few steps that execute in order, modifying a shared counter in `ContextData`.
-    *   **Code Example:**
-        ```rust
-        use orka::{Pipeline, ContextData, PipelineControl, OrkaError, OrkaResult, Orka};
-        use std::sync::Arc;
-        use tracing::info; // For logging
+1. [Core Concepts](#1-core-concepts)
+2. [A First Pipeline](#2-a-first-pipeline)
+3. [Steps: Optionality, Skipping, and Mutation](#3-steps-optionality-skipping-and-mutation)
+4. [Handlers and Control Flow](#4-handlers-and-control-flow)
+5. [Sub-Contexts: Extractors and Merging](#5-sub-contexts-extractors-and-merging)
+6. [Conditional Scopes: Branching Workflows](#6-conditional-scopes-branching-workflows)
+7. [The Orka Registry](#7-the-orka-registry)
+8. [Validation and Setup Errors](#8-validation-and-setup-errors)
+9. [Error Handling](#9-error-handling)
+10. [Best Practices](#10-best-practices)
 
-        // Define Context Data
-        #[derive(Clone, Debug, Default)]
-        struct MySimpleContext {
-            counter: i32,
-            message: String,
-        }
+## 1. Core Concepts
 
-        // Define Application Error (must be From<OrkaError>)
-        #[derive(Debug, thiserror::Error)]
-        enum MyAppError {
-            #[error("Orka framework error: {0}")]
-            Orka(#[from] OrkaError),
-            #[error("Task failed: {0}")]
-            Task(String),
-        }
+**`Pipeline<TData, Err>`** is an ordered sequence of named steps. `TData` is the shared state the whole pipeline operates on; `Err` is the error type its handlers return, which must implement `From<OrkaError>` so framework failures can flow through it.
 
-        async fn run_simple_pipeline_example() -> Result<(), MyAppError> {
-            // Initialize tracing (optional, for example output)
-            // tracing_subscriber::fmt::init();
+**`ContextData<T>`** is `Arc<RwLock<T>>`. Cloning it shares the same underlying data. Lock guards from `read()` and `write()` are blocking and **must be dropped before any `.await`**.
 
-            // 1. Define the pipeline
-            let mut pipeline = Pipeline::<MySimpleContext, MyAppError>::new(&[
-                ("initialize", false, None),
-                ("increment", false, None),
-                ("finalize", false, None),
-            ]);
+**Steps** each have three phases — `before`, `on`, `after` — and any number of handlers may be registered per phase. Handlers within a phase run in registration order.
 
-            // 2. Register handlers
-            pipeline.on_root("initialize", |ctx_data: ContextData<MySimpleContext>| {
-                Box::pin(async move {
-                    let mut guard = ctx_data.write();
-                    guard.counter = 0;
-                    guard.message = "Initialized".to_string();
-                    info!("Step Initialize: Counter set to {}, Message: '{}'", guard.counter, guard.message);
-                    Ok(PipelineControl::Continue)
-                })
-            });
+**`PipelineControl`** is what a handler returns to steer execution: `Continue` or `Stop`. **`PipelineResult`** is the outcome of a whole run: `Completed` or `Stopped`.
 
-            pipeline.on_root("increment", |ctx_data: ContextData<MySimpleContext>| {
-                Box::pin(async move {
-                    let mut guard = ctx_data.write();
-                    guard.counter += 1;
-                    // Example of a handler-specific error
-                    if guard.counter > 5 { // Arbitrary condition for failure
-                        return Err(MyAppError::Task("Counter exceeded limit in increment step".to_string()));
-                    }
-                    info!("Step Increment: Counter incremented to {}", guard.counter);
-                    Ok(PipelineControl::Continue)
-                })
-            });
+**Conditional scopes** let one step dispatch to one of several sub-pipelines (`Pipeline<SData, Err>`) chosen by runtime predicates.
 
-            pipeline.on_root("finalize", |ctx_data: ContextData<MySimpleContext>| {
-                Box::pin(async move {
-                    let guard = ctx_data.read();
-                    guard.message.push_str(" and Finalized");
-                    info!("Step Finalize: Message: '{}'", guard.message);
-                    Ok(PipelineControl::Continue)
-                })
-            });
+**`Orka<ApplicationError>`** is a registry keyed by `TData`'s `TypeId`, so an application can hold many workflows and run them by handing over the matching context.
 
-            // 3. Create initial context
-            let initial_context = ContextData::new(MySimpleContext::default());
+Import the common surface with:
 
-            // 4. Run the pipeline (can be run directly or via Orka registry)
-            info!("Running pipeline directly...");
-            let result = pipeline.run(initial_context.clone()).await?;
-            info!("Pipeline direct run result: {:?}", result);
+```rust
+use orka::prelude::*;
+```
 
-            let final_guard = initial_context.read();
-            assert_eq!(final_guard.counter, 1);
-            assert_eq!(final_guard.message, "Initialized and Finalized");
-            info!("Final Context: Counter = {}, Message = '{}'", final_guard.counter, final_guard.message);
+This brings in `Pipeline`, `ContextData`, `PipelineControl`, `PipelineResult`, `StepDef`, `SkipCondition`, `OrkaError`, `OrkaResult`, and `Orka`. Advanced items — `Handler`, `ContextDataExtractorImpl`, the pipeline providers, and the conditional-scope builder types — are imported from the crate root when needed.
 
-            Ok(())
-        }
+## 2. A First Pipeline
 
-        // To run this (e.g., in a test or main):
-        // #[tokio::main]
-        // async fn main() { run_simple_pipeline_example().await.unwrap(); }
-        ```
+```rust
+use orka::prelude::*;
 
-*   **Example 2: Conditional Logic with a Scoped Pipeline**
-    *   **Use Case:** Demonstrates a main pipeline that, based on a condition in its context, either executes Scoped Pipeline A or Scoped Pipeline B.
-    *   **Code Example:**
-        ```rust
-        use orka::{
-            Pipeline, ContextData, PipelineControl, OrkaError, ConditionalScopeBuilder, Orka,
-            PipelineResult as OrkaPipelineResult, // Renamed to avoid conflict
-        };
-        use std::sync::Arc;
-        use tracing::info;
+#[derive(Clone, Debug, Default)]
+struct ReportContext {
+  rows: Vec<String>,
+  summary: String,
+}
 
-        // --- Shared Error and Contexts ---
-        #[derive(Debug, thiserror::Error)]
-        enum BranchingError {
-            #[error("Orka framework error: {0}")]
-            Orka(#[from] OrkaError),
-            #[error("Scoped task failed: {0}")]
-            ScopedTask(String),
-            #[error("Main task failed: {0}")]
-            MainTask(String),
-        }
+#[derive(Debug, thiserror::Error)]
+enum ReportError {
+  #[error(transparent)]
+  Orka(#[from] OrkaError),
+  #[error("no rows to report")]
+  Empty,
+}
 
-        #[derive(Clone, Debug, Default)]
-        struct MainBranchingContext {
-            branch_condition: bool,
-            shared_value: i32,
-            log: String,
-        }
+#[tokio::main]
+async fn main() -> Result<(), ReportError> {
+  let mut pipeline = Pipeline::<ReportContext, ReportError>::new(["load", "summarize", "publish"]);
 
-        #[derive(Clone, Debug, Default)]
-        struct ScopedDataContextA {
-            input_value: i32,
-            processed_value_a: i32,
-        }
-        #[derive(Clone, Debug, Default)]
-        struct ScopedDataContextB {
-            input_value: i32,
-            processed_value_b: i32,
-        }
+  pipeline
+    .on_root("load", |ctx| async move {
+      ctx.write().rows = vec!["a".into(), "b".into()];
+      Ok(PipelineControl::Continue)
+    })
+    .on_root("summarize", |ctx| async move {
+      let count = ctx.read().rows.len();
+      if count == 0 {
+        return Err(ReportError::Empty);
+      }
+      ctx.write().summary = format!("{count} rows");
+      Ok(PipelineControl::Continue)
+    })
+    .on_root("publish", |ctx| async move {
+      println!("{}", ctx.read().summary);
+      Ok(PipelineControl::Continue)
+    });
 
-        // --- Scoped Pipeline Factories ---
-        async fn factory_a(
-            _main_ctx: ContextData<MainBranchingContext>,
-        ) -> Result<Arc<Pipeline<ScopedDataContextA, BranchingError>>, OrkaError> {
-            let mut p_a = Pipeline::new(&[("process_a", false, None)]);
-            p_a.on_root("process_a", |s_ctx: ContextData<ScopedDataContextA>| Box::pin(async move {
-                let mut s_guard = s_ctx.write();
-                s_guard.processed_value_a = s_guard.input_value * 10;
-                info!("Scoped Pipeline A: Processed {} -> {}", s_guard.input_value, s_guard.processed_value_a);
-                Ok(PipelineControl::Continue)
-            }));
-            Ok(Arc::new(p_a))
-        }
-        async fn factory_b(
-            _main_ctx: ContextData<MainBranchingContext>,
-        ) -> Result<Arc<Pipeline<ScopedDataContextB, BranchingError>>, OrkaError> {
-            let mut p_b = Pipeline::new(&[("process_b", false, None)]);
-            p_b.on_root("process_b", |s_ctx: ContextData<ScopedDataContextB>| Box::pin(async move {
-                let mut s_guard = s_ctx.write();
-                s_guard.processed_value_b = s_guard.input_value + 100;
-                info!("Scoped Pipeline B: Processed {} -> {}", s_guard.input_value, s_guard.processed_value_b);
-                Ok(PipelineControl::Continue)
-            }));
-            Ok(Arc::new(p_b))
-        }
+  let ctx = ContextData::new(ReportContext::default());
+  match pipeline.run(ctx.clone()).await? {
+    PipelineResult::Completed => println!("completed"),
+    PipelineResult::Stopped => println!("stopped early"),
+  }
 
-        async fn run_conditional_pipeline_example(use_branch_a: bool) -> Result<MainBranchingContext, BranchingError> {
-            // tracing_subscriber::fmt::init();
-            let mut pipeline = Pipeline::<MainBranchingContext, BranchingError>::new(&[
-                ("setup", false, None),
-                ("conditional_processing", false, None),
-                ("integrate_results", false, None),
-            ]);
+  Ok(())
+}
+```
 
-            pipeline.on_root("setup", |ctx| Box::pin(async move {
-                ctx.write().shared_value = 5;
-                Ok(PipelineControl::Continue)
-            }));
+`Pipeline::new` takes step names in execution order and accepts anything iterable of string-likes — `&["a", "b"]`, `["a", "b"]`, or a `Vec<String>` built at runtime:
 
-            pipeline.conditional_scopes_for_step("conditional_processing")
-                .add_dynamic_scope( // Use Scoped Pipeline A
-                    factory_a,
-                    |main_ctx| { // Extractor for ScopedDataContextA
-                        let val = main_ctx.read().shared_value;
-                        Ok(ContextData::new(ScopedDataContextA { input_value: val, ..Default::default() }))
-                    }
-                )
-                .on_condition(|main_ctx| main_ctx.read().branch_condition) // Condition for A
-                .add_dynamic_scope( // Use Scoped Pipeline B
-                    factory_b,
-                    |main_ctx| { // Extractor for ScopedDataContextB
-                        let val = main_ctx.read().shared_value;
-                        Ok(ContextData::new(ScopedDataContextB { input_value: val, ..Default::default() }))
-                    }
-                )
-                .on_condition(|main_ctx| !main_ctx.read().branch_condition) // Condition for B
-                .finalize_conditional_step(false);
+```rust
+let names: Vec<String> = config.stages.iter().map(|s| s.name.clone()).collect();
+let pipeline = Pipeline::<ReportContext, ReportError>::new(names);
+```
 
-            pipeline.on_root("integrate_results", |ctx| Box::pin(async move {
-                // This step would typically look at what the scoped pipeline put into SData
-                // and integrate it back into TData if necessary.
-                // For this example, the scoped pipelines just log.
-                // We'll add a log message to the main context.
-                let mut guard = ctx.write();
-                if guard.branch_condition {
-                    guard.log.push_str("Branch A was chosen. ");
-                } else {
-                    guard.log.push_str("Branch B was chosen. ");
-                }
-                info!("Main Pipeline: Integrating results. Log: {}", guard.log);
-                Ok(PipelineControl::Continue)
-            }));
+Every step starts out **required** with no skip condition.
 
-            let initial_context = ContextData::new(MainBranchingContext {
-                branch_condition: use_branch_a,
-                ..Default::default()
-            });
-            pipeline.run(initial_context.clone()).await?;
-            
-            let final_data = initial_context.read().clone(); // Clone the inner data
-            Ok(final_data)
-        }
-        
-        // To run this (e.g., in a test or main):
-        // #[tokio::main]
-        // async fn main() {
-        //     let result_a = run_conditional_pipeline_example(true).await.unwrap();
-        //     info!("Final result (Branch A): {:?}", result_a);
-        //     assert!(result_a.log.contains("Branch A"));
-        //
-        //     let result_b = run_conditional_pipeline_example(false).await.unwrap();
-        //     info!("Final result (Branch B): {:?}", result_b);
-        //     assert!(result_b.log.contains("Branch B"));
-        // }
-        ```
+## 3. Steps: Optionality, Skipping, and Mutation
 
-**3. Configuration System:**
+Optionality and skip conditions are chained after construction:
 
-*   **(a) Overview:** Orka itself does not have a complex configuration system exposed to the end-user for its core operations. Configuration primarily happens through:
-    *   **Pipeline Definition:** Constructing `Pipeline` instances with specific steps.
-    *   **Handler Registration:** Providing closures or functions as handlers.
-    *   **`ConditionalScopeBuilder` API:** Fluent API calls to define conditional logic.
-    *   **`Orka` Registry:** Registering pipelines.
-    Application-specific configuration (like database URLs, API keys for services called by handlers) is managed by the application using Orka, not by Orka itself.
-*   **(b) Primary Configuration Types:** Not applicable in the sense of library-wide config structs. Configuration is programmatic via the API.
-*   **(c) Key Configuration Enums/Options:**
-    *   `orka::core::control::PipelineControl`: (Enum) Used in `ConditionalScopeBuilder::if_no_scope_matches` to determine behavior. Variants: `Continue`, `Stop`.
+```rust
+pipeline
+  .optional("notify")                                  // may have no handlers; scope errors swallowed
+  .required("audit")                                   // back to the default
+  .skip_if("validate", |ctx| ctx.read().already_valid) // evaluated at run time
+  .clear_skip_condition("validate");
+```
 
-**4. Main API Sections / Functional Areas:**
+A **required** step with no handlers fails the run with `OrkaError::HandlerMissing`. An **optional** step with no handlers is simply skipped, and errors from its conditional scopes are swallowed so the pipeline continues.
 
-*   **A. Pipeline Definition & Execution**
-    *   **Primary Types:** `orka::Pipeline<TData, Err>`, `orka::core::step::StepDef<TData>`, `orka::core::context_data::ContextData<T>`
-    *   **Common Methods/Functions:**
-        1.  **`Pipeline::new(step_defs: &[(&str, bool, Option<SkipCondition<TData>>)]) -> Self`**
-            *   Constructs a new pipeline definition with an ordered list of named steps, their optionality, and skip conditions.
-        2.  **`Pipeline::on_root<F, UserProvidedErr>(&mut self, step_name: &str, handler_fn: impl Fn(ContextData<TData>) -> F + Send + Sync + 'static)`** (and `before_root`, `after_root`)
-            *   Where `F: Future<Output = Result<PipelineControl, UserProvidedErr>> + Send + 'static`, `UserProvidedErr: Into<Err> + Send + Sync + 'static`.
-            *   Registers an asynchronous handler for a specific phase of a named step.
-        3.  **`Pipeline::run(&self, ctx_data: ContextData<TData>) -> Future<Output = Result<PipelineResult, Err>>`**
-            *   Asynchronously executes all defined steps and handlers of the pipeline using the provided initial context.
-    *   **Supporting Types:**
-        *   `orka::core::context::Handler<TData, Err>` (Type Alias): The signature for handler functions.
-        *   `orka::core::control::PipelineControl` (Enum): Output of handlers to control flow.
-        *   `orka::core::control::PipelineResult` (Enum): Final outcome of `Pipeline::run`.
+A **skip condition** is checked immediately before the step runs. If it returns `true`, none of the step's `before`/`on`/`after` handlers execute.
 
-*   **B. Conditional Workflow Branching**
-    *   **Primary Types:** `orka::conditional::builder::ConditionalScopeBuilder<'pipeline, TData, Err>`, `orka::conditional::builder::ConditionalScopeConfigurator<...>`, `orka::conditional::provider::PipelineProvider<TData, SData, MainErr>` (Trait)
-    *   **Common Methods/Functions:**
-        1.  **`Pipeline::conditional_scopes_for_step(&mut self, step_name: &str) -> ConditionalScopeBuilder<TData, Err>`**
-            *   Initiates the definition of conditional logic for a specified step in the main pipeline.
-        2.  **`ConditionalScopeBuilder::add_dynamic_scope<SData, F, Fut>(self, pipeline_factory: F, extractor_fn: impl Fn(ContextData<TData>) -> Result<ContextData<SData>, OrkaError> + Send + Sync + 'static) -> ConditionalScopeConfigurator<...>`**
-            *   Where `F: Fn(ContextData<TData>) -> Fut`, `Fut: Future<Output = Result<Arc<Pipeline<SData, Err>>, OrkaError>>`.
-            *   Adds a conditional scope whose sub-pipeline (`Pipeline<SData, Err>`) is sourced from an asynchronous factory function; requires an extractor for the sub-context.
-        3.  **`ConditionalScopeConfigurator::on_condition(mut self, condition_fn: impl Fn(ContextData<TData>) -> bool + Send + Sync + 'static) -> ConditionalScopeBuilder<TData, Err>`**
-            *   Sets the boolean predicate that determines if the configured scope should be executed.
-        4.  **`ConditionalScopeBuilder::finalize_conditional_step(self, optional_for_main_step: bool)`**
-            *   Completes the conditional setup for the step, embedding the logic into the main pipeline.
-    *   **Supporting Types:**
-        *   `orka::conditional::provider::StaticPipelineProvider<SData, Err>`: Provides a pre-built scoped pipeline.
-        *   `orka::conditional::provider::FunctionalPipelineProvider<TData, SData, Err, F, Fut>`: Provides a scoped pipeline via a factory function.
+Steps can be added and removed while building:
 
-*   **C. Pipeline Registry & Management**
-    *   **Primary Types:** `orka::registry::Orka<ApplicationError>`
-    *   **Common Methods/Functions:**
-        1.  **`Orka::new() -> Self`**
-            *   Creates a new, empty Orka pipeline registry.
-        2.  **`Orka::register_pipeline<TData, PipelineHandlerError>(&self, pipeline: Pipeline<TData, PipelineHandlerError>)`**
-            *   Where `PipelineHandlerError: From<OrkaError>`, `ApplicationError: From<PipelineHandlerError>`.
-            *   Registers a fully defined pipeline with the registry, keyed by its `TData` type.
-        3.  **`Orka::run<TData>(&self, ctx_data: ContextData<TData>) -> Future<Output = Result<PipelineResult, ApplicationError>>`**
-            *   Looks up and executes the pipeline registered for the given `TData` type using the provided context.
-    *   **Supporting Types:** None directly, but interacts with `Pipeline` and `ContextData`.
+```rust
+pipeline
+  .insert_before_step("charge", "fraud_check")
+  .insert_after_step("charge", "receipt")
+  .optional("receipt")
+  .remove_step("legacy_step");
+```
 
-**5. Specialized Features:**
+Inserted steps are required by default; chain `.optional(..)` or `.skip_if(..)` to configure them. `remove_step` also drops every handler, extractor, and conditional configuration registered against that step, and is a no-op for an unknown name.
 
-*   **Conditional Execution of Scoped Pipelines (Plugin-like Architecture)**
-    *   **Concept & Purpose:** Allows a single step in a main pipeline to act as a dispatcher, dynamically choosing one of several specialized sub-pipelines to execute based on runtime conditions. This is useful for scenarios like selecting different payment gateways, handling various event types from a webhook, or implementing strategy patterns.
-    *   **Key Types/Methods:**
-        *   `Pipeline::conditional_scopes_for_step(...) -> ConditionalScopeBuilder<...>`: Entry point.
-        *   `ConditionalScopeBuilder::add_dynamic_scope<SData, F, Fut>(...)`: Adds a scope where the sub-pipeline (`Pipeline<SData, Err>`) is created by `pipeline_factory: F` (where `Fut::Output = Result<Arc<Pipeline<SData, Err>>, OrkaError>`). The `extractor_fn: impl Fn(ContextData<TData>) -> Result<ContextData<SData>, OrkaError>` provides the sub-pipeline's context.
-        *   `ConditionalScopeConfigurator::on_condition(...)`: Sets the condition for a scope.
-        *   `PipelineProvider<TData, SData, MainErr>` (Trait): Abstract way to get a scoped pipeline.
+## 4. Handlers and Control Flow
 
-**6. Error Handling:**
+Handlers are registered with `before_root`, `on_root`, and `after_root`. Each takes a step name and a closure receiving `ContextData<TData>` and returning a future:
 
-*   **(a) Primary Error Type(s):**
-    *   `orka::error::OrkaError` (Enum): The main error type for the Orka framework itself. It covers errors related to pipeline configuration, execution integrity (e.g., missing handlers, type mismatches), and failures within framework components like extractors or pipeline providers.
-*   **(b) Key Error Variants (of `OrkaError`):**
-    *   `StepNotFound { step_name: String }`: A referenced pipeline step was not defined.
-    *   `HandlerMissing { step_name: String }`: A non-optional step lacks necessary handlers.
-    *   `ExtractorFailure { step_name: String, source: anyhow::Error }`: A sub-context extractor function failed.
-    *   `PipelineProviderFailure { step_name: String, source: anyhow::Error }`: A `PipelineProvider` failed to yield a scoped pipeline.
-    *   `TypeMismatch { step_name: String, expected_type: String }`: An error during context downcasting.
-    *   `HandlerError { source: anyhow::Error }`: A wrapper for errors originating from user code that are converted into `OrkaError` (e.g., errors from services called by handlers within certain Orka-internal pipeline types).
-    *   `ConfigurationError { step_name: String, message: String }`: Generic configuration issues (e.g., pipeline not found in registry).
-    *   `Internal(String)`: For miscellaneous internal Orka errors.
-*   **(c) Standard Result Alias:**
-    *   `pub type OrkaResult<T, E = OrkaError> = std::result::Result<T, E>;`
-    *   User applications are expected to define their own error types (e.g., `AppError`) and implement `From<OrkaError>` for them, allowing Orka framework errors to be integrated into the application's error handling scheme. Pipelines (`Pipeline<TData, Err>`) and the Orka registry (`Orka<ApplicationError>`) are generic over these application-defined error types.
+```rust
+pipeline
+  .before_root("charge", |ctx| async move {
+    tracing::info!(order = %ctx.read().order_id, "charging");
+    Ok(PipelineControl::Continue)
+  })
+  .on_root("charge", |ctx| async move {
+    let amount = ctx.read().total;              // guard dropped at end of statement
+    let receipt = gateway::charge(amount).await?; // `?` converts via From
+    ctx.write().receipt_id = receipt.id;
+    Ok(PipelineControl::Continue)
+  })
+  .after_root("charge", |ctx| async move {
+    ctx.write().log.push("charged".into());
+    Ok(PipelineControl::Continue)
+  });
+```
+
+The future must resolve to `Result<PipelineControl, Err>` where `Err` is the pipeline's own error type. Because `Err` is fixed by the pipeline, a bare `Ok(PipelineControl::Continue)` infers correctly, and `?` converts other error types through `From` as usual.
+
+Returning `PipelineControl::Stop` halts immediately: no further handlers in the current step, and no further steps. The run resolves to `Ok(PipelineResult::Stopped)`.
+
+Returning `Err(..)` aborts the run and propagates the error out of `run`.
+
+### Locks and `.await`
+
+`ContextData` guards are blocking. Never hold one across a suspension point:
+
+```rust
+// Wrong — guard is live across the await.
+.on_root("fetch", |ctx| async move {
+  let mut data = ctx.write();
+  data.body = http::get(&data.url).await?;
+  Ok(PipelineControl::Continue)
+})
+
+// Right — read what you need, drop the guard, then await.
+.on_root("fetch", |ctx| async move {
+  let url = ctx.read().url.clone();
+  let body = http::get(&url).await?;
+  ctx.write().body = body;
+  Ok(PipelineControl::Continue)
+})
+```
+
+## 5. Sub-Contexts: Extractors and Merging
+
+A step can operate on a focused slice of the context instead of the whole thing. Register an extractor for the step, then an `on` handler typed to the extracted data.
+
+`ContextData::project` is the idiomatic way to write an extractor: it takes a read lock, clones out the part you want, releases the lock, and hands back a new `ContextData`.
+
+```rust
+pipeline
+  .set_extractor("validate_customer", |main: ContextData<OrderContext>| {
+    Ok(main.project(|d| d.customer.clone()))
+  })
+  .on("validate_customer", |sub: ContextData<CustomerInfo>| async move {
+    if !sub.read().email.contains('@') {
+      return Err(OrderError::InvalidEmail);
+    }
+    sub.write().is_validated = true;
+    Ok(PipelineControl::Continue)
+  });
+```
+
+Annotating the closure parameter (`|sub: ContextData<CustomerInfo>|`) is what tells Orka which sub-context type you mean.
+
+### Detached versus merging extractors
+
+This is the most common source of surprise. **`set_extractor` produces a detached sub-context.** The sub-handler above sets `is_validated`, but it does so on its own `ContextData`, and the root `OrderContext` never sees it.
+
+To fold the work back into the parent, use `set_extractor_with_merge` and supply a merge function `Fn(&mut TData, &SData)`:
+
+```rust
+pipeline
+  .set_extractor_with_merge(
+    "validate_customer",
+    |main: ContextData<OrderContext>| Ok(main.project(|d| d.customer.clone())),
+    |root, sub| root.customer = sub.clone(),
+  )
+  .on("validate_customer", |sub: ContextData<CustomerInfo>| async move {
+    sub.write().is_validated = true;
+    Ok(PipelineControl::Continue)
+  });
+```
+
+The merge runs with a write lock on the root and a read lock on the sub-context, and **only when the sub-handler returns `Ok`** — a failed sub-handler leaves the root untouched.
+
+Use the detached form when the sub-pipeline only reads, or when you deliberately want its mutations discarded. Use the merging form whenever its results matter. `examples/sub_context.rs` runs both side by side.
+
+## 6. Conditional Scopes: Branching Workflows
+
+A conditional step dispatches to one of several sub-pipelines. Scopes are tested in registration order, and the first whose condition holds is executed.
+
+### Static scopes
+
+Use `add_static_scope` when the sub-pipelines are built once up front:
+
+```rust
+use std::sync::Arc;
+
+let card_pipeline: Arc<Pipeline<PaymentInfo, OrderError>> = Arc::new(build_card_pipeline());
+let wire_pipeline: Arc<Pipeline<PaymentInfo, OrderError>> = Arc::new(build_wire_pipeline());
+
+pipeline
+  .conditional_scopes_for_step("pay")
+  .add_static_scope(card_pipeline, |main: ContextData<OrderContext>| {
+    Ok(main.project(|d| d.payment.clone()))
+  })
+  .with_merge(|root, sub| root.payment = sub.clone())
+  .on_condition(|main| main.read().method == Method::Card)
+  .add_static_scope(wire_pipeline, |main: ContextData<OrderContext>| {
+    Ok(main.project(|d| d.payment.clone()))
+  })
+  .with_merge(|root, sub| root.payment = sub.clone())
+  .on_condition(|main| main.read().method == Method::Wire)
+  .if_no_scope_matches(PipelineControl::Continue)
+  .finalize_conditional_step(false);
+```
+
+The chain reads: add a scope, optionally attach a merge, give it a condition, repeat. `.with_merge(..)` goes between `add_static_scope`/`add_dynamic_scope` and `on_condition`. Without it, the scope is detached exactly like a plain `set_extractor` — the sub-pipeline works on its own context and the main context sees nothing of it. With it, the sub-context is folded back after the scoped pipeline succeeds.
+
+### Dynamic scopes
+
+Use `add_dynamic_scope` when the sub-pipeline must be built per run — from a lookup, a tenant config, or anything else async:
+
+```rust
+async fn tenant_pipeline(
+  main: ContextData<OrderContext>,
+) -> Result<Arc<Pipeline<PaymentInfo, OrderError>>, OrkaError> {
+  let tenant = main.read().tenant_id.clone();
+  registry::lookup(&tenant)
+    .await
+    .map_err(|e| OrkaError::Internal(format!("no pipeline for tenant {tenant}: {e}")))
+}
+
+pipeline
+  .conditional_scopes_for_step("pay")
+  .add_dynamic_scope(tenant_pipeline, |main: ContextData<OrderContext>| {
+    Ok(main.project(|d| d.payment.clone()))
+  })
+  .with_merge(|root, sub| root.payment = sub.clone())
+  .on_condition(|main| main.read().is_multi_tenant)
+  .finalize_conditional_step(false);
+```
+
+### Finalizing
+
+`finalize_conditional_step(optional_for_main_step)` **must** terminate the chain — the collected scopes are discarded otherwise. Its argument sets the step's optionality: pass `true` and errors from a matched scope are swallowed and the pipeline continues; pass `false` and they propagate. `Pipeline::validate` reports a builder you forgot to finalize.
+
+The step is created automatically if it does not already exist. Conditional scopes **append** their handler, so `on_root` handlers already registered on the same step still run.
+
+`if_no_scope_matches(..)` sets what happens when no condition holds — `PipelineControl::Continue` by default.
+
+## 7. The Orka Registry
+
+`Orka<ApplicationError>` holds many pipelines, keyed by their context type:
+
+```rust
+let orka = Orka::<AppError>::new();
+
+orka.register_pipeline(order_pipeline)?;   // keyed by OrderContext
+orka.register_pipeline(refund_pipeline)?;  // keyed by RefundContext
+
+let ctx = ContextData::new(OrderContext::default());
+let outcome = orka.run(ctx.clone()).await?;
+```
+
+`register_pipeline` validates the pipeline and returns `OrkaResult<()>`, so setup mistakes surface at registration rather than on the first run. Pipelines are keyed by `TData`, so registering a second pipeline for the same context type replaces the first.
+
+`ApplicationError` must be `From<OrkaError>` and `From<PipelineHandlerError>` for every pipeline registered — the registry converts each pipeline's error into the application error. When your handlers use `OrkaError` directly, `Orka::new_default()` is a convenience constructor for `Orka<OrkaError>`.
+
+`Orka::run` looks up the pipeline by the type of the context you hand it. If nothing is registered for that type it returns `OrkaError::ConfigurationError`.
+
+## 8. Validation and Setup Errors
+
+Orka splits setup mistakes into two categories.
+
+**Panics** — programming errors caught immediately at the call that made them:
+
+*   Referring to a step name that does not exist (`on_root("typo", ..)`).
+*   Declaring the same step name twice in `Pipeline::new`, or inserting a step that already exists.
+*   Registering `on::<SData>` for a step with no extractor.
+
+**`validate()`** — problems that are only visible once the whole pipeline is assembled:
+
+```rust
+pipeline.validate()?;
+```
+
+It reports:
+
+1.  A required step with no `before`/`on`/`after` handlers, which would otherwise fail at run time with `OrkaError::HandlerMissing`.
+2.  An extractor registered for a step that has no `on::<SData>` handler consuming it.
+3.  A `conditional_scopes_for_step` builder that was never finalized, so its scopes were silently discarded.
+
+All problems are collected into a single `OrkaError::ConfigurationError`, not just the first. Calling `validate` yourself is optional — `Orka::register_pipeline` runs it for you — but it is worth doing in a test when you run pipelines directly via `Pipeline::run`.
+
+## 9. Error Handling
+
+`OrkaError` covers framework-level failures:
+
+| Variant | Meaning |
+| --- | --- |
+| `StepNotFound` | A referenced step was not defined. |
+| `HandlerMissing` | A required step has no handlers. |
+| `ExtractorFailure` | A sub-context extractor returned an error. |
+| `PipelineProviderFailure` | A scoped-pipeline provider failed to yield a pipeline. |
+| `TypeMismatch` | A context downcast failed. |
+| `HandlerError` | Wraps an external error converted into `OrkaError`. |
+| `ConfigurationError` | Validation failure, or no pipeline registered for a type. |
+| `NoConditionalScopeMatched` | No scope condition held for a conditional step. |
+| `Internal` | Miscellaneous internal failure. |
+
+Applications define their own error type and derive the conversion:
+
+```rust
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+  #[error(transparent)]
+  Orka(#[from] OrkaError),
+  #[error("database: {0}")]
+  Db(#[from] sqlx::Error),
+  #[error("payment declined: {0}")]
+  Declined(String),
+}
+```
+
+With that in place, `Pipeline<TData, AppError>` handlers can use `?` on any error convertible into `AppError`, and Orka's own failures arrive as `AppError::Orka`.
+
+`OrkaError` also implements `From<anyhow::Error>`, wrapping it as `HandlerError`. An `anyhow::Error` that already contains an `OrkaError` stays nested rather than being unwrapped; the causal chain is preserved through `#[source]` either way.
+
+`OrkaResult<T, E = OrkaError>` is the crate's result alias, used for `validate` and `register_pipeline`.
+
+### Propagation rules
+
+*   A handler error aborts the run and propagates out of `Pipeline::run`.
+*   A failing sub-handler skips the merge — the root context is left untouched.
+*   A failing conditional scope propagates unless the step is optional, in which case the error is logged and the pipeline continues.
+*   Extractor and provider failures are `OrkaError`s converted into the pipeline's `Err` via `From`.
+
+## 10. Best Practices
+
+**Keep guards short.** Read what you need into locals, drop the guard, then `.await`. A guard held across a suspension point will deadlock the pipeline.
+
+**Prefer merging extractors when results matter.** A detached sub-context silently discards writes, which reads as a no-op bug. Reach for `set_extractor_with_merge` and `.with_merge(..)` unless you specifically want isolation.
+
+**Mark genuinely optional work optional.** A required step with no handlers fails the run; an optional one is skipped. Use `skip_if` for work that is conditional on data rather than on configuration.
+
+**Validate in tests.** Assert `pipeline.validate().is_ok()` for pipelines you run directly, so unfinalized builders and orphaned extractors are caught in CI.
+
+**Give steps stable, descriptive names.** They are the key for every registration and appear in errors and tracing spans.
+
+**Keep sub-contexts small.** Extractors clone, so project the smallest slice a sub-pipeline actually needs.

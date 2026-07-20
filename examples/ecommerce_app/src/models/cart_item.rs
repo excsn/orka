@@ -1,5 +1,3 @@
-// orka_project/examples/ecommerce_app/src/models/cart_item.rs
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize}; // Deserialize for request body
 use sqlx::FromRow;

@@ -1,13 +1,10 @@
-// orka/src/conditional/provider.rs
-
 //! Defines the `PipelineProvider` trait and its implementations for sourcing
 //! `Arc<Pipeline<SData, MainErr>>` instances.
 //! Operates with `ContextData<TData>`.
 
 use crate::core::context_data::ContextData;
-use crate::error::{OrkaError, OrkaResult}; // OrkaResult is Result<_, OrkaError>
-use crate::pipeline::Pipeline; // Will be Pipeline<SData, MainErr>
-use anyhow::Context as AnyhowContext; // For .with_context()
+use crate::error::OrkaError;
+use crate::pipeline::Pipeline;
 use async_trait::async_trait;
 use std::future::Future;
 use std::marker::PhantomData;

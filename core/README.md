@@ -3,91 +3,107 @@
 [![Crates.io](https://img.shields.io/crates/v/orka.svg)](https://crates.io/crates/orka)
 [![Docs.rs](https://docs.rs/orka/badge.svg)](https://docs.rs/orka)
 
-Orka is an asynchronous, pluggable, and type-safe workflow engine for Rust, designed to orchestrate complex multi-step business processes with robust context management and conditional logic. It simplifies the development of intricate, stateful workflows by providing a clear structure for defining steps, managing shared data, handling errors consistently, and enabling dynamic execution paths, thereby improving code organization and maintainability for complex operations.
+Orka is an asynchronous, pluggable, and type-safe workflow engine for Rust, designed to orchestrate complex multi-step business processes with robust context management and conditional logic. It simplifies the development of intricate, stateful workflows by providing a clear structure for defining steps, managing shared data, handling errors consistently, and enabling dynamic execution paths.
+
+Upgrading from 0.1? See **[MIGRATION.md](MIGRATION.md)**.
 
 ## Key Features
 
-*   **🚀 Type-Safe Pipelines:** Define workflows (`Pipeline<TData, Err>`) generic over shared context data (`TData`) and a specific error type (`Err`), ensuring compile-time safety throughout your process.
-*   **⚡ Asynchronous Handlers:** Execute pipeline steps with `async fn` handlers, perfect for non-blocking I/O and efficient resource use.
-*   **📦 Shared Context Management:** Utilize `ContextData<T>` (`Arc<RwLock<T>>`) for safe, shared, and mutable access to pipeline state across handlers, with enforced lock guard discipline.
-*   **🌿 Conditional Logic & Scoped Pipelines:** Employ a powerful `ConditionalScopeBuilder` to define dynamic branching, executing isolated sub-pipelines (`Pipeline<SData, Err>`) based on runtime conditions. Supports dynamic or static sourcing of these scoped pipelines.
-*   **🛡️ Flexible Error Handling:** Integrate Orka with your application's error ecosystem. Pipelines are generic over their error type, and the core `OrkaError` can be seamlessly converted (via `From<OrkaError>`).
-*   **🔍 Sub-Context Extraction:** Allow handlers to operate on specific, type-safe sub-sections (`SData`) of the main pipeline's context (`TData`) through extractors.
-*   **🏛️ Pipeline Registry:** Manage and run multiple distinct pipeline definitions within your application using the `Orka<ApplicationError>` type-keyed registry.
+*   **Type-Safe Pipelines:** Define workflows (`Pipeline<TData, Err>`) generic over shared context data (`TData`) and a specific error type (`Err`), ensuring compile-time safety throughout your process.
+*   **Asynchronous Handlers:** Execute pipeline steps with `async` handlers, suited to non-blocking I/O.
+*   **Shared Context Management:** `ContextData<T>` (`Arc<RwLock<T>>`) gives safe, shared, mutable access to pipeline state across handlers.
+*   **Conditional Logic & Scoped Pipelines:** `ConditionalScopeBuilder` defines dynamic branching, executing sub-pipelines (`Pipeline<SData, Err>`) chosen at runtime, sourced statically or from an async factory.
+*   **Flexible Error Handling:** Pipelines are generic over their error type; `OrkaError` converts into it via `From<OrkaError>`.
+*   **Sub-Context Extraction:** Handlers can operate on a type-safe sub-section (`SData`) of the main context, optionally merging their work back.
+*   **Setup Validation:** `Pipeline::validate()` reports configuration mistakes before the first run.
+*   **Pipeline Registry:** Manage and run multiple pipeline definitions through the `Orka<ApplicationError>` type-keyed registry.
 
 ## Getting Started
 
 ### Prerequisites
 
-*   **Rust:** A recent stable Rust toolchain. See [rustup.rs](https://rustup.rs/).
-*   **Tokio:** Orka leverages Tokio for its asynchronous runtime. Ensure your project uses Tokio.
+*   **Rust:** A recent stable toolchain. See [rustup.rs](https://rustup.rs/).
+*   **Tokio:** Orka runs on the Tokio async runtime.
 
 ### Installation
 
-Add Orka to your `Cargo.toml` dependencies:
-
 ```toml
 [dependencies]
-orka = "0.1.0" # Replace with the latest version from crates.io
-tokio = { version = "1", features = ["full"] } # Orka requires a Tokio runtime
-# Add other necessary crates like tracing, serde, thiserror, etc.
+orka = "0.2"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
 ```
 
-### Quick Overview
+### Quick Start
 
-1.  **Define Context Data:** Create a struct for your pipeline's shared state (e.g., `MyWorkflowData`).
-2.  **Define Error Type:** Create an application-specific error enum that implements `From<orka::OrkaError>`.
-3.  **Create a Pipeline:** Instantiate `orka::Pipeline<MyWorkflowData, MyAppError>::new(...)` with named steps.
-4.  **Register Handlers:** Use methods like `pipeline.on_root(...)` to attach asynchronous logic to steps.
-    ```rust
-    use orka::{Pipeline, ContextData, PipelineControl, OrkaError};
-    use std::sync::Arc;
+```rust
+use orka::prelude::*;
 
-    #[derive(Clone, Default)]
-    struct MyContext { count: i32 }
-    #[derive(Debug, thiserror::Error)]
-    enum MyError { #[error(transparent)] Orka(#[from] OrkaError), /* ... */ }
+#[derive(Clone, Debug, Default)]
+struct OrderContext {
+  order_id: String,
+  total: u64,
+  paid: bool,
+}
 
-    let mut pipeline = Pipeline::<MyContext, MyError>::new(&[("step1", false, None)]);
-    pipeline.on_root("step1", |ctx: ContextData<MyContext>| Box::pin(async move {
-        ctx.write().count += 1;
-        Ok(PipelineControl::Continue)
-    }));
-    ```
-5.  **(Optional) Define Conditional Logic:** Use `pipeline.conditional_scopes_for_step(...)` for branching.
-6.  **(Optional) Use the Registry:** Create an `orka::Orka<MyAppError>` instance and register your pipeline(s).
-7.  **Run the Pipeline:**
-    ```rust
-    # async {
-    # use orka::{Pipeline, ContextData, PipelineControl, OrkaError, Orka, PipelineResult};
-    # #[derive(Clone, Default)] struct MyContext { count: i32 }
-    # #[derive(Debug, thiserror::Error)] enum MyError { #[error(transparent)] Orka(#[from] OrkaError),}
-    # let mut pipeline = Pipeline::<MyContext, MyError>::new(&[("step1", false, None)]);
-    # pipeline.on_root("step1", |ctx: ContextData<MyContext>| Box::pin(async move { Ok(PipelineControl::Continue) }));
-    let initial_data = ContextData::new(MyContext::default());
-    let outcome = pipeline.run(initial_data.clone()).await;
-    // Or, if using the registry:
-    // let orka_registry = Orka::<MyError>::new();
-    // orka_registry.register_pipeline(pipeline);
-    // let outcome = orka_registry.run(initial_data.clone()).await;
+#[derive(Debug, thiserror::Error)]
+enum AppError {
+  #[error(transparent)]
+  Orka(#[from] OrkaError),
+  #[error("payment declined: {0}")]
+  Declined(String),
+}
 
-    match outcome {
-        Ok(PipelineResult::Completed) => println!("Pipeline completed! Count: {}", initial_data.read().count),
-        Ok(PipelineResult::Stopped) => println!("Pipeline stopped."),
-        Err(e) => println!("Pipeline failed: {:?}", e),
-    }
-    # };
-    ```
+#[tokio::main]
+async fn main() -> Result<(), AppError> {
+  let mut pipeline = Pipeline::<OrderContext, AppError>::new(["price", "charge", "notify"]);
+
+  pipeline
+    .optional("notify")
+    .skip_if("charge", |ctx| ctx.read().total == 0)
+    .on_root("price", |ctx| async move {
+      ctx.write().total = 4_200;
+      Ok(PipelineControl::Continue)
+    })
+    .on_root("charge", |ctx| async move {
+      let total = ctx.read().total;
+      if total > 10_000 {
+        return Err(AppError::Declined("over limit".into()));
+      }
+      ctx.write().paid = true;
+      Ok(PipelineControl::Continue)
+    })
+    .on_root("notify", |ctx| async move {
+      println!("order {} paid", ctx.read().order_id);
+      Ok(PipelineControl::Continue)
+    });
+
+  let orka = Orka::<AppError>::new();
+  orka.register_pipeline(pipeline)?;
+
+  let ctx = ContextData::new(OrderContext::default());
+  match orka.run(ctx.clone()).await? {
+    PipelineResult::Completed => println!("done, paid = {}", ctx.read().paid),
+    PipelineResult::Stopped => println!("stopped early"),
+  }
+
+  Ok(())
+}
+```
+
+Step names come first; optionality and skip conditions are chained afterwards. Every registration method returns `&mut Self`, so setup reads as one chain. Handlers are plain `async move` blocks returning `Result<PipelineControl, Err>` — no `Box::pin`, no turbofish.
 
 ## Documentation
 
-*   **[Orka Usage Guide (README.GUIDE.md)](README.GUIDE.md):** For a detailed walkthrough of core concepts, advanced features, and best practices.
-*   **[API Reference (docs.rs/orka)](https://docs.rs/orka):** Full, detailed API documentation.
-*   **[Examples (`examples/`)](../examples):** Check out the `ecommerce_app` for a practical application of Orka.
+*   **[Usage Guide (README.USAGE.md)](README.USAGE.md):** Walkthrough of core concepts, sub-contexts, conditional branching, and error handling.
+*   **[API Reference (API_REFERENCE.md)](API_REFERENCE.md):** Signature-level reference.
+*   **[Migration Guide (MIGRATION.md)](MIGRATION.md):** Upgrading from 0.1 to 0.2.
+*   **[docs.rs/orka](https://docs.rs/orka):** Generated API documentation.
+*   **[Examples (`examples/`)](examples):** Runnable examples, from `basic_pipeline` through `conditional_dynamic`.
 
 ## Contributing
 
-Contributions are highly welcome! Whether it's bug reports, feature suggestions, documentation improvements, or code contributions, please feel free to open an issue or pull request on [GitHub](https://github.com/excsn/orka).
+Contributions are welcome — bug reports, feature suggestions, documentation improvements, or code. Open an issue or pull request on [GitHub](https://github.com/excsn/orka).
 
 ## License
 

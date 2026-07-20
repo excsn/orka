@@ -1,10 +1,10 @@
-// orka_project/examples/ecommerce_app/src/models/order_item.rs
-
-use serde::Serialize; // Add Deserialize if you construct OrderItems from e.g. cart data requests
+use serde::Serialize;
 use sqlx::FromRow;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, FromRow)] // Add Deserialize if needed
+// Line items are part of the example's schema but no route reads them back yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, FromRow)]
 pub struct OrderItem {
   pub id: Uuid,
   pub order_id: Uuid,

@@ -1,151 +1,195 @@
-// orka/src/pipeline/hooks.rs
-
 //! Contains methods for registering `before`, `on`, and `after` handlers
-//! for pipeline steps. Handlers for `Pipeline<TData, Err>` operate on
-//! `ContextData<TData>` and return `Result<_, Err>`, or on `ContextData<SData>`
-//! for sub-context handlers, also ultimately resulting in `Result<_, Err>`.
+//! for pipeline steps.
+//!
+//! Handlers take a `ContextData<TData>` (or `ContextData<SData>` for sub-context
+//! handlers) and return a future resolving to `Result<PipelineControl, Err>`, where
+//! `Err` is the pipeline's own error type. Because `Err` is fixed, a plain `Ok(...)`
+//! infers correctly and `?` converts other error types through `From` as usual:
+//!
+//! ```ignore
+//! pipeline
+//!   .on_root("load", |ctx| async move {
+//!     let cfg = std::fs::read_to_string("cfg.toml")?; // converts via From<io::Error>
+//!     ctx.write().config = cfg;
+//!     Ok(PipelineControl::Continue)
+//!   })
+//!   .on_root("notify", |ctx| async move {
+//!     Ok(PipelineControl::Continue)
+//!   });
+//! ```
 
 use tracing::{event, instrument, Level};
 
 use crate::core::context::{
   downcast_context_data,
-  AnyContextDataExtractor,
   ContextDataExtractorImpl,
   Handler, // Handler<TData, Err>
 };
 use crate::core::context_data::ContextData;
 use crate::core::control::PipelineControl;
-use crate::error::{OrkaError, OrkaResult}; // OrkaResult is Result<_, OrkaError> - used by extractor
-use crate::pipeline::definition::Pipeline; // This is Pipeline<TData, Err> where Err already has From<OrkaError> from its struct def
+use crate::error::OrkaError;
+use crate::pipeline::definition::Pipeline;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
-// This impl block needs to ensure Err satisfies all bounds required by the Pipeline struct
-// and any methods it calls from other impl blocks of Pipeline.
-// Since Pipeline<TData, Err> struct definition requires Err: From<OrkaError>,
-// this impl block must also reflect that for consistency and to call methods
-// defined in other impl blocks that rely on this bound.
 impl<TData, Err> Pipeline<TData, Err>
 where
   TData: 'static + Send + Sync,
-  // This bound ensures that methods like `ensure_step_exists` (which are defined
-  // under an impl block requiring Err: From<OrkaError> because Pipeline struct requires it)
-  // are callable.
   Err: std::error::Error + From<OrkaError> + Send + Sync + 'static,
 {
-  /// Registers a `before` hook for a given step.
+  /// Registers a `before` hook for a step. Returns `&mut Self` so registrations chain.
   ///
-  /// The `handler_fn` takes `ContextData<TData>` and returns a `Future`
-  /// resolving to `Result<PipelineControl, UserProvidedErr>`, where
-  /// `UserProvidedErr` must be convertible into the pipeline's `Err` type.
-  pub fn before_root<F, UserProvidedErr>(
+  /// # Panics
+  /// Panics if the step does not exist.
+  pub fn before_root<F>(
     &mut self,
     step_name: &str,
     handler_fn: impl Fn(ContextData<TData>) -> F + Send + Sync + 'static,
-  ) where
-    F: Future<Output = Result<PipelineControl, UserProvidedErr>> + Send + 'static,
-    UserProvidedErr: Into<Err> + Send + Sync + 'static, // User's error converts to pipeline's Err
+  ) -> &mut Self
+  where
+    F: Future<Output = Result<PipelineControl, Err>> + Send + 'static,
   {
-    self.ensure_step_exists(step_name); // Now callable due to Err: From<OrkaError> on this impl block
-    let final_handler: Handler<TData, Err> = Box::new(move |ctx_data| {
-      let user_fut = handler_fn(ctx_data);
-      Box::pin(async move { user_fut.await.map_err(Into::into) }) // UserProvidedErr.into() -> Err
-    });
+    self.ensure_step_exists(step_name);
+    let final_handler: Handler<TData, Err> = Box::new(move |ctx_data| Box::pin(handler_fn(ctx_data)));
     self
       .before
       .entry(step_name.to_string())
       .or_default()
       .push(final_handler);
+    self
   }
 
-  /// Registers an `on` hook for a given step.
-  /// (Similar to `before_root` regarding error types).
-  pub fn on_root<F, UserProvidedErr>(
+  /// Registers an `on` hook for a step. Returns `&mut Self` so registrations chain.
+  ///
+  /// # Panics
+  /// Panics if the step does not exist.
+  pub fn on_root<F>(
     &mut self,
     step_name: &str,
     handler_fn: impl Fn(ContextData<TData>) -> F + Send + Sync + 'static,
-  ) where
-    F: Future<Output = Result<PipelineControl, UserProvidedErr>> + Send + 'static,
-    UserProvidedErr: Into<Err> + Send + Sync + 'static,
+  ) -> &mut Self
+  where
+    F: Future<Output = Result<PipelineControl, Err>> + Send + 'static,
   {
-    self.ensure_step_exists(step_name); // Now callable
-    let final_handler: Handler<TData, Err> = Box::new(move |ctx_data| {
-      let user_fut = handler_fn(ctx_data);
-      Box::pin(async move { user_fut.await.map_err(Into::into) })
-    });
+    self.ensure_step_exists(step_name);
+    let final_handler: Handler<TData, Err> = Box::new(move |ctx_data| Box::pin(handler_fn(ctx_data)));
     self.on.entry(step_name.to_string()).or_default().push(final_handler);
+    self
   }
 
-  /// Registers an `after` hook for a given step.
-  /// (Similar to `before_root` regarding error types).
-  pub fn after_root<F, UserProvidedErr>(
+  /// Registers an `after` hook for a step. Returns `&mut Self` so registrations chain.
+  ///
+  /// # Panics
+  /// Panics if the step does not exist.
+  pub fn after_root<F>(
     &mut self,
     step_name: &str,
     handler_fn: impl Fn(ContextData<TData>) -> F + Send + Sync + 'static,
-  ) where
-    F: Future<Output = Result<PipelineControl, UserProvidedErr>> + Send + 'static,
-    UserProvidedErr: Into<Err> + Send + Sync + 'static,
+  ) -> &mut Self
+  where
+    F: Future<Output = Result<PipelineControl, Err>> + Send + 'static,
   {
-    self.ensure_step_exists(step_name); // Now callable
-    let final_handler: Handler<TData, Err> = Box::new(move |ctx_data| {
-      let user_fut = handler_fn(ctx_data);
-      Box::pin(async move { user_fut.await.map_err(Into::into) })
-    });
+    self.ensure_step_exists(step_name);
+    let final_handler: Handler<TData, Err> = Box::new(move |ctx_data| Box::pin(handler_fn(ctx_data)));
     self.after.entry(step_name.to_string()).or_default().push(final_handler);
+    self
   }
 
   // --- Sub-Context Handlers (using ContextData) ---
 
-  /// Registers an extractor from `ContextData<TData>` to `ContextData<SData>`.
+  /// Registers an extractor producing a `ContextData<SData>` sub-context for a step.
   ///
-  /// The `extractor_fn` returns `Result<ContextData<SData>, OrkaError>` (i.e., `Result<_, OrkaError>`).
-  /// This is because extractor failure is a framework-level concern.
-  /// `SData` must be `Send + Sync + 'static`.
+  /// The sub-context is **detached**: it is a separate `ContextData`, so writes made by
+  /// the `on::<SData>` handler are *not* reflected in the root context. Use
+  /// [`set_extractor_with_merge`](Self::set_extractor_with_merge) when you need them back.
+  ///
+  /// [`ContextData::project`] is the usual way to write one of these.
+  ///
+  /// # Panics
+  /// Panics if the step does not exist.
   pub fn set_extractor<SData>(
     &mut self,
     step_name: &str,
     // Extractor's own failure is an OrkaError. This is consistent.
     extractor_fn: impl Fn(ContextData<TData>) -> Result<ContextData<SData>, OrkaError> + Send + Sync + 'static,
-  ) where
+  ) -> &mut Self
+  where
     SData: 'static + Send + Sync,
   {
-    self.ensure_step_exists(step_name); // Now callable
+    self.ensure_step_exists(step_name);
     let extractor_impl = ContextDataExtractorImpl::<TData, SData>::new(extractor_fn);
     self.extractors.insert(step_name.to_string(), Arc::new(extractor_impl));
     event!(Level::DEBUG, %step_name, sub_context_data_type = %std::any::type_name::<SData>(), "Extractor set.");
+    self
   }
 
-  /// Registers an `on` hook for a given step, operating on an extracted `ContextData<SData>`.
+  /// Registers an extractor that also folds the sub-context back into the root context.
   ///
-  /// An extractor (via `set_extractor`) must have been registered for this step.
-  /// The sub-handler `handler_fn` takes `ContextData<SData>` and returns
-  /// `Result<PipelineControl, SubHandlerErr>`, where `SubHandlerErr` must be convertible
-  /// into the main pipeline's `Err` type.
+  /// After the step's `on::<SData>` handler succeeds, `merge_fn` runs with a write lock on
+  /// the root context and a read lock on the sub-context, letting the sub-pipeline's work
+  /// land in the parent:
   ///
-  /// The `Err` type of the main pipeline (already constrained by this `impl` block to be `From<OrkaError>`)
-  /// is used to handle potential errors from the extraction process itself (which are `OrkaError`).
+  /// ```ignore
+  /// pipeline
+  ///   .set_extractor_with_merge(
+  ///     "validate",
+  ///     |main| Ok(main.project(|d| d.customer.clone())),
+  ///     |root, sub| root.customer = sub.clone(),
+  ///   )
+  ///   .on("validate", |sub: ContextData<Customer>| async move {
+  ///     sub.write().is_validated = true;
+  ///     Ok(PipelineControl::Continue)
+  ///   });
+  /// ```
+  ///
+  /// The merge runs **only when the handler returns `Ok`** — a failed sub-handler leaves
+  /// the root context untouched.
+  ///
+  /// # Panics
+  /// Panics if the step does not exist.
+  pub fn set_extractor_with_merge<SData>(
+    &mut self,
+    step_name: &str,
+    extractor_fn: impl Fn(ContextData<TData>) -> Result<ContextData<SData>, OrkaError> + Send + Sync + 'static,
+    merge_fn: impl Fn(&mut TData, &SData) + Send + Sync + 'static,
+  ) -> &mut Self
+  where
+    SData: 'static + Send + Sync,
+  {
+    self.ensure_step_exists(step_name);
+    let extractor_impl = ContextDataExtractorImpl::<TData, SData>::with_merge(extractor_fn, merge_fn);
+    self.extractors.insert(step_name.to_string(), Arc::new(extractor_impl));
+    event!(Level::DEBUG, %step_name, sub_context_data_type = %std::any::type_name::<SData>(), "Extractor with merge set.");
+    self
+  }
+
+  /// Registers an `on` hook that operates on the step's extracted `ContextData<SData>`.
+  ///
+  /// Annotate the closure parameter (`|sub: ContextData<MyType>|`) — that is what tells
+  /// Orka which `SData` you mean.
+  ///
+  /// # Panics
+  /// Panics if the step does not exist, or if no extractor has been registered for it via
+  /// [`set_extractor`](Self::set_extractor) / [`set_extractor_with_merge`](Self::set_extractor_with_merge).
   #[instrument(
         name = "Pipeline::on<SData>",
         skip_all,
         fields(step_name, sub_context_data_type = %std::any::type_name::<SData>())
     )]
-  pub fn on<SData, F, SubHandlerErr>(
+  pub fn on<SData, F>(
     &mut self,
     step_name: &str,
     handler_fn: impl Fn(ContextData<SData>) -> F + Send + Sync + 'static,
-  ) where
+  ) -> &mut Self
+  where
     SData: 'static + Send + Sync, // SData is the underlying data type for the sub-context
-    F: Future<Output = Result<PipelineControl, SubHandlerErr>> + Send + 'static,
-    SubHandlerErr: Into<Err> + Send + Sync + 'static + std::fmt::Debug, // Sub-handler's error converts to main pipeline's Err
-                                                                        // The `Err: From<OrkaError>` bound is already present on the `impl` block.
-                                                                        // No need to restate it here.
+    F: Future<Output = Result<PipelineControl, Err>> + Send + 'static,
   {
-    self.ensure_step_exists(step_name); // Now callable
+    self.ensure_step_exists(step_name);
 
     let extractor_arc = self.extractors.get(step_name).cloned().unwrap_or_else(|| {
       panic!(
-        "Orka panic: No extractor found for step '{}' when registering on<{}> handler. Call set_extractor first.",
+        "Orka setup error: No extractor found for step '{}' when registering on<{}> handler. Call set_extractor first.",
         step_name,
         std::any::type_name::<SData>()
       )
@@ -165,7 +209,7 @@ where
 
         // 1. Extraction yields OrkaResult<Box<dyn Any + Send>> (i.e. Result<_, OrkaError>)
         //    We need to map OrkaError to Err if extraction fails.
-        let any_sub_ctx_data = match current_extractor.extract_sub_context_data(root_ctx_data) {
+        let any_sub_ctx_data = match current_extractor.extract_sub_context_data(root_ctx_data.clone()) {
           Ok(boxed_any) => boxed_any,
           Err(orka_extraction_err) => {
             // This is an OrkaError
@@ -201,18 +245,34 @@ where
         };
         event!(Level::TRACE, step_name = %step_name_clone, "Sub-context ContextData extraction and downcast successful.");
 
-        // 3. Call user's SData handler, which returns Result<_, SubHandlerErr>. Map SubHandlerErr to Err.
+        // 3. Call user's SData handler. No lock guard is live across this await.
         event!(Level::TRACE, step_name = %step_name_clone, "Calling user's on<SData> handler.");
-        (user_sdata_handler)(sub_sdata_ctx).await.map_err(|sub_err| {
-          // sub_err is SubHandlerErr
-          event!(Level::ERROR, step_name = %step_name_clone, error = ?sub_err, "User's on<SData> handler failed.");
-          // Convert SubHandlerErr to main pipeline's Err
-          sub_err.into()
-        })
+        let control = match (user_sdata_handler)(sub_sdata_ctx.clone()).await {
+          Ok(control) => control,
+          Err(handler_err) => {
+            event!(Level::ERROR, step_name = %step_name_clone, error = %handler_err, "User's on<SData> handler failed.");
+            // Deliberately skip the merge: a failed sub-handler leaves the root untouched.
+            return Err(handler_err);
+          }
+        };
+
+        // 4. Fold the sub-context back into the root, if this extractor was given a merge fn.
+        //    No `.await` occurs while the guards taken inside are held.
+        if current_extractor.has_merge() {
+          event!(Level::TRACE, step_name = %step_name_clone, "Merging sub-context back into root context.");
+          if let Err(merge_err) = current_extractor.merge_sub_context_data(root_ctx_data, &sub_sdata_ctx) {
+            event!(Level::ERROR, step_name = %step_name_clone, error = %merge_err, "Merging sub-context back failed.");
+            return Err(Err::from(merge_err));
+          }
+        }
+
+        Ok(control)
       })
     });
 
     self.on.entry(step_name.to_string()).or_default().push(wrapped_handler);
+    self.sub_handler_steps.insert(step_name.to_string());
     event!(Level::DEBUG, "on<SData> handler registered.");
+    self
   }
 }

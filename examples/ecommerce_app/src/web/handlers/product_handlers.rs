@@ -1,10 +1,7 @@
-// examples/ecommerce_app/src/web/handlers/product_handlers.rs
-
-use actix_web::{web, HttpResponse, Responder};
+use actix_web::{web, HttpResponse};
 use serde::Deserialize;
 use serde_json::json;
-// use sqlx::Row; // Not needed if using query_as directly with struct that impl FromRow
-use tracing::{error, info, instrument, warn, Level};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::errors::AppError;
@@ -12,17 +9,14 @@ use crate::models::product::Product;
 use crate::state::AppState;
 
 #[derive(Deserialize, Debug)]
-pub struct ListProductsQuery {
-  // pub page: Option<i64>,
-  // pub limit: Option<i64>,
-}
+pub struct ListProductsQuery {}
 
-#[instrument(name = "handler::list_products", skip(app_state, query_params))]
+#[instrument(name = "handler::list_products", skip_all)]
 pub async fn list_products_handler(
   app_state: web::Data<AppState>,
-  query_params: web::Query<ListProductsQuery>,
+  _query_params: web::Query<ListProductsQuery>,
 ) -> Result<HttpResponse, AppError> {
-  info!("Attempting to list products (using runtime queries).");
+  info!("Attempting to list products.");
 
   let products: Vec<Product> = sqlx::query_as(
     "SELECT id, name, description, price_cents, stock_quantity, created_at, updated_at FROM products ORDER BY name ASC",
@@ -42,23 +36,22 @@ pub async fn list_products_handler(
   })))
 }
 
-#[instrument(name = "handler::get_product", skip(app_state, path), fields(product_id = %path.as_ref()))] // Use .as_ref() for logging Path content
+#[instrument(name = "handler::get_product", skip(app_state, path), fields(product_id = %path.as_ref()))]
 pub async fn get_product_handler(
   app_state: web::Data<AppState>,
-  path: web::Path<Uuid>, // path is of type Path<Uuid>
+  path: web::Path<Uuid>,
 ) -> Result<HttpResponse, AppError> {
-  // Correct way to get the inner Uuid value from web::Path
-  let product_id_to_fetch = path.into_inner(); // THIS LINE IS CORRECTED
+  let product_id_to_fetch = path.into_inner();
 
   info!(
-    "Attempting to fetch product with ID: {} (using runtime queries).",
+    "Attempting to fetch product with ID: {}.",
     product_id_to_fetch
   );
 
   let product_opt: Option<Product> = sqlx::query_as(
     "SELECT id, name, description, price_cents, stock_quantity, created_at, updated_at FROM products WHERE id = $1",
   )
-  .bind(product_id_to_fetch) // Use the extracted Uuid
+  .bind(product_id_to_fetch)
   .fetch_optional(&app_state.db_pool)
   .await
   .map_err(|e| {

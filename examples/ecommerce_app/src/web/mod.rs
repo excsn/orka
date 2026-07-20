@@ -1,9 +1,10 @@
-// examples/ecommerce_app/src/web/mod.rs
+// The HTTP layer is defined but deliberately NOT mounted in `main.rs` — the server binds a
+// port and serves nothing. Everything below is therefore unreachable, hence the allow.
+// To actually serve these routes, add `.configure(web::configure_app_routes)` to the
+// `App::new()` chain in main.rs.
+#![allow(dead_code)]
 
-// Declare child modules
 pub mod handlers;
 pub mod routes;
 
-// Re-export key items if desired.
-// For example, to allow main.rs or tests to easily access routing configuration:
 pub use routes::configure_app_routes;

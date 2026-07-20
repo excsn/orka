@@ -1,14 +1,12 @@
-// orka/src/conditional/scope.rs
-
 //! Defines `ConditionalScope` which represents one potential execution path
 //! within a conditional step, and `AnyConditionalScope` for type erasure.
 //! Operates on `ContextData<TData>` and `ContextData<SData>`.
 
 use crate::conditional::provider::PipelineProvider; // Now PipelineProvider<TData, SData, MainErr>
+use crate::core::context::{ConditionFn, ExtractorFn, MergeFn};
 use crate::core::context_data::ContextData;
 use crate::core::control::PipelineControl;
-use crate::error::{OrkaError, OrkaResult}; // OrkaResult (Result<_, OrkaError>) for extractor's own failure
-                                           // crate::PipelineResult from scoped_pipeline_instance.run will be Result<_, MainErr>
+use crate::error::OrkaError;
 use async_trait::async_trait;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -32,11 +30,15 @@ where
 
   /// Extracts the sub-context `ContextData<SData>` from the main context `ContextData<TData>`.
   /// The extractor itself can fail with an `OrkaError`.
-  pub(crate) extractor:
-    Arc<dyn Fn(ContextData<TData>) -> Result<ContextData<SData>, OrkaError> + Send + Sync + 'static>,
+  pub(crate) extractor: ExtractorFn<TData, SData>,
 
   /// The condition (evaluated on `ContextData<TData>`) that determines if this scope should run.
-  pub(crate) condition: Arc<dyn Fn(ContextData<TData>) -> bool + Send + Sync + 'static>,
+  pub(crate) condition: ConditionFn<TData>,
+
+  /// Optional write-back, folding the scoped context into the main context after the scoped
+  /// pipeline finishes successfully. `None` leaves the scope detached (the historical behaviour).
+  pub(crate) merge: Option<MergeFn<TData, SData>>,
+
   pub(crate) _phantom_main_err: PhantomData<MainErr>, // To mark usage of MainErr if not used elsewhere
 }
 
@@ -146,20 +148,32 @@ where
     // 3. Run the obtained pipeline instance with ContextData<SData>.
     // Pipeline::run now takes ContextData<SData> and returns Result<crate::core::control::PipelineResult, MainErr>.
     event!(Level::DEBUG, "Running scoped pipeline.");
-    match scoped_pipeline_instance.run(sub_sdata_ctx).await {
+    let control = match scoped_pipeline_instance.run(sub_sdata_ctx.clone()).await {
       Ok(crate::core::control::PipelineResult::Completed) => {
         event!(Level::INFO, "Scoped pipeline completed successfully.");
-        Ok(PipelineControl::Continue)
+        PipelineControl::Continue
       }
       Ok(crate::core::control::PipelineResult::Stopped) => {
         event!(Level::INFO, "Scoped pipeline was stopped by one of its handlers.");
-        Ok(PipelineControl::Stop)
+        PipelineControl::Stop
       }
       Err(main_err_from_scoped_pipeline) => {
         // This is already MainErr
         event!(Level::ERROR, error = %main_err_from_scoped_pipeline, "Scoped pipeline execution failed.");
-        Err(main_err_from_scoped_pipeline) // Propagate the MainErr from the scoped pipeline
+        // Deliberately skip the merge: a failed scope leaves the main context untouched.
+        return Err(main_err_from_scoped_pipeline); // Propagate the MainErr from the scoped pipeline
       }
+    };
+
+    // 4. Fold the scoped context back into the main context, if a merge was configured.
+    //    Both guards are taken and dropped inside this block; no `.await` happens here.
+    if let Some(merge) = self.merge.as_ref() {
+      event!(Level::TRACE, "Merging scoped context back into main context.");
+      let sub_guard = sub_sdata_ctx.read();
+      let mut main_guard = main_ctx_data.write();
+      merge(&mut *main_guard, &*sub_guard);
     }
+
+    Ok(control)
   }
 }

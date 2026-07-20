@@ -1,5 +1,3 @@
-// orka/src/core/control.rs
-
 //! Defines signals for controlling pipeline flow and the outcome of a pipeline run.
 
 /// Signal from a handler indicating whether the pipeline should continue or stop.

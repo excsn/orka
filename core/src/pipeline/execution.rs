@@ -1,5 +1,3 @@
-// orka/src/pipeline/execution.rs
-
 //! Contains the `Pipeline::run()` method, responsible for executing the pipeline's steps and handlers.
 //! The pipeline is `Pipeline<TData, Err>`, and `run` returns `Result<PipelineResult, Err>`.
 
@@ -62,9 +60,9 @@ where
         }
       }
 
-      let has_before_handlers = self.before.get(step_name_str).map_or(false, |v| !v.is_empty());
-      let has_on_handlers = self.on.get(step_name_str).map_or(false, |v| !v.is_empty());
-      let has_after_handlers = self.after.get(step_name_str).map_or(false, |v| !v.is_empty());
+      let has_before_handlers = self.before.get(step_name_str).is_some_and(|v| !v.is_empty());
+      let has_on_handlers = self.on.get(step_name_str).is_some_and(|v| !v.is_empty());
+      let has_after_handlers = self.after.get(step_name_str).is_some_and(|v| !v.is_empty());
 
       if !has_before_handlers && !has_on_handlers && !has_after_handlers {
         if step_def.optional {
@@ -127,19 +125,9 @@ where
             }
           }
         }
-      } else if !step_def.optional && !has_before_handlers && !has_after_handlers {
-        // This implies a non-optional step was expected to have 'on' handlers but didn't.
-        // This check might be slightly redundant if the earlier check for any handlers covers it,
-        // but it's a specific case for 'on' handlers being primary.
-        event!(
-          Level::ERROR,
-          "Non-optional step is missing 'on' handlers (and has no before/after)."
-        );
-        return Err(Err::from(OrkaError::HandlerMissing {
-          // Err::from works
-          step_name: step_def.name.clone(),
-        }));
       }
+      // No `else` branch here: a required step with no handlers at all was already rejected
+      // by the `has_*_handlers` guard above, so "missing `on` handlers" is unreachable.
 
       // AFTER phase
       if let Some(handlers) = self.after.get(step_name_str) {

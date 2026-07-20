@@ -1,6 +1,4 @@
-// orka_core/examples/registry_basic.rs
-
-use orka::{ContextData, Orka, OrkaError, OrkaResult, Pipeline, PipelineControl, PipelineResult};
+use orka::{ContextData, Orka, OrkaError, Pipeline, PipelineControl, PipelineResult};
 use std::sync::Arc;
 use tracing::{error, info};
 
@@ -17,7 +15,6 @@ struct ProductWorkflowContext {
   update_log: Vec<String>,
 }
 
-// --- Custom Error Type for this example ---
 #[derive(Debug, thiserror::Error)]
 enum RegistryExampleError {
   #[error("User Workflow Error: {0}")]
@@ -25,26 +22,22 @@ enum RegistryExampleError {
   #[error("Product Workflow Error: {0}")]
   ProductError(String),
   #[error("Orka Framework Error in Registry Example: {0}")]
-  Orka(#[from] OrkaError), // To allow Orka errors to be converted
+  Orka(#[from] OrkaError),
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-  // Use Box<dyn Error> for main
   tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
   info!("--- Orka Registry Basic Example ---");
 
-  // 1. Create an Orka registry instance
-  // The registry is generic over the ApplicationError type.
+  // The registry is generic over the application error type; each pipeline it holds is
+  // keyed by its context type.
   let orka_registry = Arc::new(Orka::<RegistryExampleError>::new());
 
-  // 2. Define and register Pipeline A (User Workflow)
-  let mut user_pipeline = Pipeline::<UserWorkflowContext, RegistryExampleError>::new(&[
-    ("validate_user", false, None),
-    ("process_user_action", false, None),
-  ]);
-  user_pipeline.on_root("validate_user", |ctx: ContextData<UserWorkflowContext>| {
-    Box::pin(async move {
+  let mut user_pipeline =
+    Pipeline::<UserWorkflowContext, RegistryExampleError>::new(["validate_user", "process_user_action"]);
+  user_pipeline
+    .on_root("validate_user", |ctx| async move {
       let mut data = ctx.write();
       let msg = format!("User Validated: {}", data.user_id);
       info!("{}", msg);
@@ -54,26 +47,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       }
       Ok(PipelineControl::Continue)
     })
-  });
-  user_pipeline.on_root("process_user_action", |ctx: ContextData<UserWorkflowContext>| {
-    Box::pin(async move {
+    .on_root("process_user_action", |ctx| async move {
       let mut data = ctx.write();
       let msg = format!("User Action Processed for: {}", data.user_id);
       info!("{}", msg);
       data.action_log.push(msg);
-      OrkaResult::<_>::Ok(PipelineControl::Continue)
-    })
-  });
-  orka_registry.register_pipeline(user_pipeline);
+      Ok(PipelineControl::Continue)
+    });
+  orka_registry.register_pipeline(user_pipeline)?;
   info!("UserWorkflowPipeline registered.");
 
-  // 3. Define and register Pipeline B (Product Workflow)
-  let mut product_pipeline = Pipeline::<ProductWorkflowContext, RegistryExampleError>::new(&[
-    ("check_product_stock", false, None),
-    ("update_product_details", false, None),
+  let mut product_pipeline = Pipeline::<ProductWorkflowContext, RegistryExampleError>::new([
+    "check_product_stock",
+    "update_product_details",
   ]);
-  product_pipeline.on_root("check_product_stock", |ctx: ContextData<ProductWorkflowContext>| {
-    Box::pin(async move {
+  product_pipeline
+    .on_root("check_product_stock", |ctx| async move {
       let mut data = ctx.write();
       let msg = format!("Stock Checked for Product: {}", data.product_id);
       info!("{}", msg);
@@ -83,26 +72,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       }
       Ok(PipelineControl::Continue)
     })
-  });
-  product_pipeline.on_root("update_product_details", |ctx: ContextData<ProductWorkflowContext>| {
-    Box::pin(async move {
+    .on_root("update_product_details", |ctx| async move {
       let mut data = ctx.write();
       let msg = format!("Details Updated for Product: {}", data.product_id);
       info!("{}", msg);
       data.update_log.push(msg);
-      Ok::<_, RegistryExampleError>(PipelineControl::Continue)
-    })
-  });
-  orka_registry.register_pipeline(product_pipeline);
+      Ok(PipelineControl::Continue)
+    });
+  orka_registry.register_pipeline(product_pipeline)?;
   info!("ProductWorkflowPipeline registered.");
 
-  // 4. Run User Workflow Pipeline via Registry
   info!("\n--- Running User Workflow ---");
-  let user_ctx_data = UserWorkflowContext {
+  let user_context = ContextData::new(UserWorkflowContext {
     user_id: "user123".to_string(),
     ..Default::default()
-  };
-  let user_context = ContextData::new(user_ctx_data);
+  });
   match orka_registry.run(user_context.clone()).await {
     Ok(PipelineResult::Completed) => {
       info!("User workflow completed successfully.");
@@ -114,13 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     _ => info!("User workflow stopped."),
   }
 
-  // 5. Run Product Workflow Pipeline via Registry
   info!("\n--- Running Product Workflow ---");
-  let product_ctx_data = ProductWorkflowContext {
+  let product_context = ContextData::new(ProductWorkflowContext {
     product_id: "prod789".to_string(),
     ..Default::default()
-  };
-  let product_context = ContextData::new(product_ctx_data);
+  });
   match orka_registry.run(product_context.clone()).await {
     Ok(PipelineResult::Completed) => {
       info!("Product workflow completed successfully.");
@@ -132,13 +114,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     _ => info!("Product workflow stopped."),
   }
 
-  // 6. Run Product Workflow that Fails
   info!("\n--- Running Failing Product Workflow ---");
-  let failing_product_ctx_data = ProductWorkflowContext {
-    product_id: "FAIL".to_string(), // This will cause an error in its pipeline
+  let failing_product_context = ContextData::new(ProductWorkflowContext {
+    product_id: "FAIL".to_string(),
     ..Default::default()
-  };
-  let failing_product_context = ContextData::new(failing_product_ctx_data);
+  });
   match orka_registry.run(failing_product_context.clone()).await {
     Ok(_) => error!("Failing product workflow unexpectedly succeeded!"),
     Err(RegistryExampleError::ProductError(msg)) => {
@@ -148,13 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Err(e) => error!("Failing product workflow failed with unexpected error type: {}", e),
   }
 
-  // 7. Attempt to run pipeline for an unregistered context type
   info!("\n--- Running Unregistered Workflow ---");
   #[derive(Clone, Default, Debug)]
-  struct UnregisteredCtx {
-    id: i32,
-  };
-  let unregistered_context = ContextData::new(UnregisteredCtx::default());
+  struct UnregisteredCtx;
+  let unregistered_context = ContextData::new(UnregisteredCtx);
   match orka_registry.run(unregistered_context).await {
     Ok(_) => error!("Unregistered workflow unexpectedly succeeded!"),
     Err(RegistryExampleError::Orka(orka_error)) => {

@@ -1,5 +1,3 @@
-// orka/src/pipeline/mod.rs
-
 //! Defines the `Pipeline<T>` struct, its construction, modification, and execution logic.
 
 pub mod definition;

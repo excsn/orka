@@ -1,13 +1,14 @@
-// orka_project/examples/ecommerce_app/src/services/email_mock.rs
-use crate::errors::Result as AppResult; // Using AppResult
+use crate::errors::Result as AppResult;
 use tracing::info;
 
+/// Echoes back what was "sent"; the example only reads `message_id`.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct SentEmailInfo {
   pub to: String,
   pub from: String,
   pub subject: String,
-  pub body_preview: String, // First N chars of body
+  pub body_preview: String,
   pub message_id: String,
 }
 
@@ -16,9 +17,8 @@ pub async fn send_mock_email(to: &str, from: &str, subject: &str, html_body: &st
     "Simulating sending email: To='{}', From='{}', Subject='{}'",
     to, from, subject
   );
-  tokio::time::sleep(std::time::Duration::from_millis(20)).await; // Simulate network latency
+  tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-  // Simulate potential failure
   if subject.to_lowercase().contains("fail_test") {
     tracing::warn!("Simulated email failure for subject: {}", subject);
     return Err(crate::errors::AppError::Internal(
