@@ -29,9 +29,9 @@ pub async fn send_welcome_email_step(ctx_data: ContextData<SendWelcomeEmailCtxDa
       // ctx_data.write().email_message_id = Some(sent_info.message_id);
       Ok(PipelineControl::Continue)
     }
-    Err(e) => { // e is AppError
+    Err(e) => {
       warn!("Failed to send welcome email to {}: {:?}", recipient_email_clone, e);
-      Err(OrkaError::HandlerError { source: anyhow::Error::new(e) }) // Wrap AppError
+      Err(OrkaError::HandlerError { source: anyhow::Error::new(e) })
     }
   }
 }
@@ -71,12 +71,12 @@ pub async fn send_order_confirmation_email_step(
       );
       Ok(PipelineControl::Continue)
     }
-    Err(e) => { // e is AppError
+    Err(e) => {
       warn!(
         "Failed to send order confirmation email for order {} to {}: {:?}",
         order_id_val, recipient_email_clone, e
       );
-      Err(OrkaError::HandlerError { source: anyhow::Error::new(e) }) // Wrap AppError
+      Err(OrkaError::HandlerError { source: anyhow::Error::new(e) })
     }
   }
 }

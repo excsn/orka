@@ -2,10 +2,8 @@ mod common;
 
 use common::*;
 use orka::{ContextData, Pipeline, PipelineControl};
-use serial_test::serial;
 
 #[tokio::test]
-#[serial]
 async fn test_context_data_is_shared_and_modified() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["step1_modify", "step2_read_modify"]);
@@ -35,7 +33,6 @@ async fn test_context_data_is_shared_and_modified() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_context_data_clone_shares_data() {
   setup_tracing();
   let original_ctx = ContextData::new(TestContext {
@@ -58,7 +55,6 @@ async fn test_context_data_clone_shares_data() {
 /// `project` builds an independent `ContextData` from part of another, so writes to the
 /// projection do not touch the source.
 #[tokio::test]
-#[serial]
 async fn test_context_data_project_is_independent() {
   setup_tracing();
   let ctx = ContextData::new(MainExtractContext {
@@ -82,7 +78,6 @@ async fn test_context_data_project_is_independent() {
 /// Guards are blocking and must not be held across `.await`. This documents the required
 /// scoping discipline; it compiles and runs only if the guards are dropped as shown.
 #[tokio::test]
-#[serial]
 async fn test_context_data_locks_with_await() {
   setup_tracing();
   let ctx = ContextData::new(TestContext::default());
@@ -103,4 +98,64 @@ async fn test_context_data_locks_with_await() {
 
   handler_logic.await;
   assert_eq!(ctx.read().counter, 1);
+}
+
+/// `with_ref`/`with_mut` make the "no guard across `.await`" rule structural rather than a
+/// convention: the closure is synchronous and the guard's scope is the call, so the lock
+/// cannot reach a suspension point. Compare the explicit scoping blocks above.
+#[tokio::test]
+async fn test_with_ref_and_with_mut_are_await_safe() {
+  setup_tracing();
+  let ctx = ContextData::new(TestContext::default());
+
+  let initial = ctx.with_ref(|c| c.counter);
+  tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+  ctx.with_mut(|c| c.counter = initial + 1);
+
+  // Back-to-back calls: each guard must have been released before returning, or this
+  // would deadlock rather than fail.
+  ctx.with_mut(|c| c.counter += 1);
+  assert_eq!(ctx.with_ref(|c| c.counter), 2);
+}
+
+/// A non-`Clone` intermediate threaded through steps needs no `Arc` and no
+/// `try_unwrap` -> mutate -> re-wrap dance: `with_mut` hands out a scoped `&mut` to the
+/// field, and returns a value, so taking ownership back out is one line.
+#[tokio::test]
+async fn test_with_mut_handles_non_clone_intermediates_in_place() {
+  setup_tracing();
+
+  // Deliberately neither Clone nor Default: the shape of parsed specs or a compiled
+  // artifact that one step produces and a later step mutates.
+  #[derive(Debug, PartialEq)]
+  struct ParsedSpecs {
+    entries: Vec<String>,
+  }
+
+  #[derive(Default)]
+  struct BuildCtx {
+    specs: Option<ParsedSpecs>,
+  }
+
+  let ctx = ContextData::new(BuildCtx::default());
+
+  // "parse" step produces it.
+  ctx.with_mut(|c| {
+    c.specs = Some(ParsedSpecs {
+      entries: vec!["alpha".to_string()],
+    })
+  });
+
+  // "mutate" step edits it in place: no Arc, no clone, no unwrap dance.
+  ctx.with_mut(|c| c.specs.as_mut().expect("set by parse step").entries.push("beta".to_string()));
+
+  // And ownership can be taken back out through the return value.
+  let taken = ctx.with_mut(|c| c.specs.take()).expect("still present");
+  assert_eq!(
+    taken,
+    ParsedSpecs {
+      entries: vec!["alpha".to_string(), "beta".to_string()]
+    }
+  );
+  assert!(ctx.with_ref(|c| c.specs.is_none()));
 }

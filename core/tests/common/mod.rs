@@ -2,11 +2,12 @@
 #![allow(dead_code)]
 
 use orka::{ContextData, OrkaError, Pipeline, PipelineControl};
-use std::sync::{
-  atomic::{AtomicUsize, Ordering},
-  Arc,
-};
+use std::sync::Arc;
 use tracing::Level;
+
+/// The shared test error, shipped by orka itself (feature `test-util`) so downstream
+/// crates get the same one. `Clone + PartialEq`, stringifies `OrkaError` via `From`.
+pub use orka::test_util::TestError;
 
 /// What a scoped-pipeline factory resolves to. Factories in the conditional tests are
 /// synchronous, so they return `Ready` rather than a boxed future.
@@ -45,32 +46,6 @@ pub struct ScopedTestContextB {
   pub alternative_message: String,
 }
 
-/// `OrkaError` is not `PartialEq` (its sources are `anyhow::Error`), so this test error
-/// stringifies framework errors to keep assertions comparable.
-#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
-pub enum TestError {
-  #[error("Orka framework error: {0:?}")]
-  Orka(String),
-
-  #[error("Test handler failed: {0}")]
-  Handler(String),
-
-  #[error("Test extractor failed: {0}")]
-  Extractor(String),
-
-  #[error("Test pipeline provider failed: {0}")]
-  Provider(String),
-
-  #[error("Test scoped task failed: {0}")]
-  ScopedTask(String),
-}
-
-impl From<OrkaError> for TestError {
-  fn from(oe: OrkaError) -> Self {
-    TestError::Orka(format!("{:?}", oe))
-  }
-}
-
 pub fn create_simple_handler(
   step_name: &'static str,
   message_to_append: &'static str,
@@ -83,10 +58,10 @@ pub fn create_simple_handler(
       guard.message.push_str(message_to_append);
       guard.steps_executed.push(step_name_owned.clone());
       tracing::debug!(target: "test_handlers", step = %step_name_owned, "executed, counter: {}, message: '{}'", guard.counter, guard.message);
-      if let Some(stop_step) = &guard.should_stop_at {
-        if stop_step == step_name_owned.as_str() {
-          return Ok(PipelineControl::Stop);
-        }
+      if let Some(stop_step) = &guard.should_stop_at
+        && stop_step == step_name_owned.as_str()
+      {
+        return Ok(PipelineControl::Stop);
       }
       Ok(PipelineControl::Continue)
     })
@@ -119,27 +94,6 @@ static TRACING_INIT: Lazy<()> = Lazy::new(|| {
 
 pub fn setup_tracing() {
   Lazy::force(&TRACING_INIT);
-}
-
-// Execution counters for scope tests. Prefer asserting on merged-back context state where
-// possible; these remain for counting how many times a provider/extractor was invoked,
-// which the context alone cannot show. Tests using them must be #[serial].
-pub static HANDLER_EXEC_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
-pub static SCOPED_A_EXEC_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
-pub static SCOPED_B_EXEC_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
-pub static EXTRACTOR_A_EXEC_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
-pub static EXTRACTOR_B_EXEC_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
-pub static PROVIDER_A_EXEC_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
-pub static PROVIDER_B_EXEC_COUNTER: Lazy<Arc<AtomicUsize>> = Lazy::new(|| Arc::new(AtomicUsize::new(0)));
-
-pub fn reset_counters() {
-  HANDLER_EXEC_COUNTER.store(0, Ordering::SeqCst);
-  SCOPED_A_EXEC_COUNTER.store(0, Ordering::SeqCst);
-  SCOPED_B_EXEC_COUNTER.store(0, Ordering::SeqCst);
-  EXTRACTOR_A_EXEC_COUNTER.store(0, Ordering::SeqCst);
-  EXTRACTOR_B_EXEC_COUNTER.store(0, Ordering::SeqCst);
-  PROVIDER_A_EXEC_COUNTER.store(0, Ordering::SeqCst);
-  PROVIDER_B_EXEC_COUNTER.store(0, Ordering::SeqCst);
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

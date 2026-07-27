@@ -5,6 +5,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+edition = "2024"
+
 # Optional: Default settings for all workspace members
 # [workspace.dependencies]
 # anyhow = "1.0"

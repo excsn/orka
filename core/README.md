@@ -29,7 +29,7 @@ Upgrading from 0.1? See **[MIGRATION.md](MIGRATION.md)**.
 
 ```toml
 [dependencies]
-orka = "0.2"
+orka = "0.3"
 tokio = { version = "1", features = ["full"] }
 thiserror = "2"
 ```

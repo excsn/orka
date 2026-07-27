@@ -3,7 +3,8 @@
 pub mod definition;
 pub mod execution;
 pub mod hooks;
-// Optional: pub mod merge; // If merge features are implemented
+pub mod runner;
 
-// Re-export the main Pipeline struct
 pub use definition::Pipeline;
+pub use execution::{PlannedAction, StepPlan};
+pub use runner::PipelineRunner;

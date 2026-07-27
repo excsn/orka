@@ -2,10 +2,8 @@ mod common;
 
 use common::*;
 use orka::{ContextData, OrkaError, Pipeline, PipelineControl, PipelineResult};
-use serial_test::serial;
 
 #[tokio::test]
-#[serial]
 async fn test_pipeline_runs_steps_in_order() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["step1", "step2", "step3"]);
@@ -28,7 +26,6 @@ async fn test_pipeline_runs_steps_in_order() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_pipeline_stops_on_pipeline_control_stop() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["stepA", "stopStep", "stepC"]);
@@ -54,7 +51,6 @@ async fn test_pipeline_stops_on_pipeline_control_stop() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_pipeline_propagates_handler_error() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["good_step", "bad_step", "another_step"]);
@@ -80,7 +76,6 @@ async fn test_pipeline_propagates_handler_error() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_pipeline_skips_step_if_condition_met() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["step1", "step_to_skip", "step3"]);
@@ -102,7 +97,6 @@ async fn test_pipeline_skips_step_if_condition_met() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_clear_skip_condition_reinstates_step() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["step1", "step2"]);
@@ -120,7 +114,6 @@ async fn test_clear_skip_condition_reinstates_step() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_non_optional_step_missing_handler_fails() {
   setup_tracing();
   let pipeline = Pipeline::<TestContext, TestError>::new(["step_with_no_handler"]);
@@ -138,7 +131,6 @@ async fn test_non_optional_step_missing_handler_fails() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_optional_step_missing_handler_succeeds() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["optional_step_no_handler"]);
@@ -152,7 +144,6 @@ async fn test_optional_step_missing_handler_succeeds() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_required_reverts_optional() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["step"]);
@@ -165,7 +156,6 @@ async fn test_required_reverts_optional() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_before_on_after_execution_order() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["main_step"]);
@@ -406,7 +396,6 @@ async fn test_sub_context_handler_stops_pipeline() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_insert_before_and_after_step() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["middle"]);
@@ -425,7 +414,6 @@ async fn test_insert_before_and_after_step() {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_remove_step_drops_its_handlers() {
   setup_tracing();
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["keep", "drop_me"]);
@@ -442,14 +430,12 @@ async fn test_remove_step_drops_its_handlers() {
 }
 
 #[tokio::test]
-#[serial]
 #[should_panic(expected = "duplicate step")]
 async fn test_duplicate_step_names_panic() {
   let _ = Pipeline::<TestContext, TestError>::new(["dup", "dup"]);
 }
 
 #[tokio::test]
-#[serial]
 #[should_panic(expected = "not found")]
 async fn test_registering_handler_for_unknown_step_panics() {
   let mut pipeline = Pipeline::<TestContext, TestError>::new(["known"]);

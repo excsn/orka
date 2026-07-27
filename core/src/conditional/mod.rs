@@ -9,8 +9,4 @@ pub mod builder;
 pub mod provider;
 pub mod scope;
 
-// Re-export the primary builder for users.
-// Other types like PipelineProvider might be used by advanced users
-// or for testing, but are often an implementation detail of the builder.
 pub use builder::ConditionalScopeBuilder;
-// pub use provider::PipelineProvider; // Optional re-export

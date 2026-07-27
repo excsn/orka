@@ -33,7 +33,47 @@ where
   async fn get_pipeline(&self, main_ctx_data: ContextData<TData>) -> Result<Arc<Pipeline<SData, MainErr>>, OrkaError>;
 }
 
-// --- Static Pipeline Provider ---
+
+/// Adapter turning an `Arc<dyn PipelineProvider<...>>` into a concrete provider type, so
+/// trait objects can flow through the (generically typed) conditional scope builder.
+///
+/// This is the injection seam behind
+/// [`add_scope_with_provider`](crate::ConditionalScopeBuilder::add_scope_with_provider):
+/// implement [`PipelineProvider`] on your own type (a recording fake, a pool, a cache)
+/// and hand it in as a trait object.
+#[derive(Clone)]
+pub struct DynPipelineProvider<TData, SData, MainErr>
+where
+  TData: 'static + Send + Sync,
+  SData: 'static + Send + Sync,
+  MainErr: std::error::Error + From<OrkaError> + Send + Sync + 'static,
+{
+  inner: Arc<dyn PipelineProvider<TData, SData, MainErr>>,
+}
+
+impl<TData, SData, MainErr> DynPipelineProvider<TData, SData, MainErr>
+where
+  TData: 'static + Send + Sync,
+  SData: 'static + Send + Sync,
+  MainErr: std::error::Error + From<OrkaError> + Send + Sync + 'static,
+{
+  pub fn new(inner: Arc<dyn PipelineProvider<TData, SData, MainErr>>) -> Self {
+    Self { inner }
+  }
+}
+
+#[async_trait]
+impl<TData, SData, MainErr> PipelineProvider<TData, SData, MainErr> for DynPipelineProvider<TData, SData, MainErr>
+where
+  TData: 'static + Send + Sync,
+  SData: 'static + Send + Sync,
+  MainErr: std::error::Error + From<OrkaError> + Send + Sync + 'static,
+{
+  async fn get_pipeline(&self, main_ctx_data: ContextData<TData>) -> Result<Arc<Pipeline<SData, MainErr>>, OrkaError> {
+    self.inner.get_pipeline(main_ctx_data).await
+  }
+}
+
 
 /// Provides a pre-existing, static `Arc<Pipeline<SData, MainErr>>`.
 #[derive(Clone)]
@@ -73,7 +113,6 @@ where
   }
 }
 
-// --- Functional Pipeline Provider ---
 
 /// Provides an `Arc<Pipeline<SData, MainErr>>` by invoking a user-supplied asynchronous factory function.
 ///
@@ -122,22 +161,15 @@ where
   Fut: Future<Output = Result<Arc<Pipeline<SData, MainErr>>, OrkaError>> + Send + 'static,
 {
   async fn get_pipeline(&self, main_ctx_data: ContextData<TData>) -> Result<Arc<Pipeline<SData, MainErr>>, OrkaError> {
-    let sdata_type_name = std::any::type_name::<SData>(); // Capture for context message
+    let sdata_type_name = std::any::type_name::<SData>();
 
-    // The user's factory future already returns Result<_, OrkaError>.
-    // If it's Ok, .with_context() does nothing.
-    // If it's Err(OrkaError), .with_context() wraps it in anyhow::Error.
-    // So, the .map_err must convert this anyhow::Error back to an OrkaError.
     (self.factory)(main_ctx_data).await.map_err(|orka_err_from_factory| {
-      // The factory itself failed with an OrkaError.
-      // We can enrich this OrkaError or return a new one.
-      // Let's create a PipelineProviderFailure, potentially wrapping the original.
       OrkaError::PipelineProviderFailure {
         step_name: format!("functional_provider_for_{}", sdata_type_name),
         source: anyhow::anyhow!(
-          "Factory for SData='{}' failed: {}", // Context message
+          "Factory for SData='{}' failed: {}",
           sdata_type_name,
-          orka_err_from_factory // This will use the Display impl of orka_err_from_factory
+          orka_err_from_factory
         ),
       }
     })

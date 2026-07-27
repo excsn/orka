@@ -2,7 +2,7 @@
 //! within a conditional step, and `AnyConditionalScope` for type erasure.
 //! Operates on `ContextData<TData>` and `ContextData<SData>`.
 
-use crate::conditional::provider::PipelineProvider; // Now PipelineProvider<TData, SData, MainErr>
+use crate::conditional::provider::PipelineProvider;
 use crate::core::context::{ConditionFn, ExtractorFn, MergeFn};
 use crate::core::context_data::ContextData;
 use crate::core::control::PipelineControl;
@@ -39,7 +39,7 @@ where
   /// pipeline finishes successfully. `None` leaves the scope detached (the historical behaviour).
   pub(crate) merge: Option<MergeFn<TData, SData>>,
 
-  pub(crate) _phantom_main_err: PhantomData<MainErr>, // To mark usage of MainErr if not used elsewhere
+  pub(crate) _phantom_main_err: PhantomData<MainErr>,
 }
 
 /// Type-erased trait for a conditional scope, allowing different `SData` types
@@ -87,66 +87,55 @@ where
             scoped_context_data_type = %std::any::type_name::<SData>(),
             main_error_type = %std::any::type_name::<MainErr>(),
         ),
-        err(Display) // This will display MainErr
+        err(Display)
     )]
   async fn execute_scoped_pipeline(&self, main_ctx_data: ContextData<TData>) -> Result<PipelineControl, MainErr> {
     event!(Level::DEBUG, "Attempting to execute conditional scope.");
 
-    // 1. Get the pipeline instance (Arc<Pipeline<SData, MainErr>>)
-    // The pipeline_provider's get_pipeline method returns Result<_, OrkaError>.
-    // We need to map this OrkaError to MainErr using the bound MainErr: From<OrkaError>.
     let scoped_pipeline_instance = match self.pipeline_provider.get_pipeline(main_ctx_data.clone()).await {
       Ok(p) => {
         event!(Level::TRACE, "Scoped pipeline instance obtained.");
         p
       }
       Err(orka_provider_err) => {
-        // orka_provider_err is OrkaError
         event!(Level::ERROR, error = %orka_provider_err, "Failed to get pipeline from provider.");
         let enriched_err = match orka_provider_err {
           OrkaError::HandlerError { source } => OrkaError::PipelineProviderFailure {
             step_name: String::from("conditional_scope_provider"), // Step name not directly known here
             source,
           },
-          // Add more specific enrichment if PipelineProviderFailure variant is returned directly
           OrkaError::PipelineProviderFailure { source, .. } => OrkaError::PipelineProviderFailure {
             step_name: String::from("conditional_scope_provider"),
             source,
           },
           other_err => other_err,
         };
-        return Err(MainErr::from(enriched_err)); // Convert OrkaError to MainErr
+        return Err(MainErr::from(enriched_err));
       }
     };
 
-    // 2. Extract sub-context data (ContextData<SData>)
-    // The extractor closure returns Result<_, OrkaError>. Map to MainErr.
     let sub_sdata_ctx: ContextData<SData> = match (self.extractor)(main_ctx_data.clone()) {
       Ok(s_ctx_data) => {
         event!(Level::TRACE, "Sub-context data extracted successfully.");
         s_ctx_data
       }
       Err(orka_extractor_err) => {
-        // orka_extractor_err is OrkaError
         event!(Level::ERROR, error = %orka_extractor_err, "Sub-context data extractor failed.");
         let enriched_err = match orka_extractor_err {
           OrkaError::HandlerError { source } => OrkaError::ExtractorFailure {
             step_name: String::from("conditional_scope_extractor"), // Step name not known here
             source,
           },
-          // Add more specific enrichment if ExtractorFailure variant is returned directly
           OrkaError::ExtractorFailure { source, .. } => OrkaError::ExtractorFailure {
             step_name: String::from("conditional_scope_extractor"),
             source,
           },
           other_err => other_err,
         };
-        return Err(MainErr::from(enriched_err)); // Convert OrkaError to MainErr
+        return Err(MainErr::from(enriched_err));
       }
     };
 
-    // 3. Run the obtained pipeline instance with ContextData<SData>.
-    // Pipeline::run now takes ContextData<SData> and returns Result<crate::core::control::PipelineResult, MainErr>.
     event!(Level::DEBUG, "Running scoped pipeline.");
     let control = match scoped_pipeline_instance.run(sub_sdata_ctx.clone()).await {
       Ok(crate::core::control::PipelineResult::Completed) => {
@@ -158,14 +147,12 @@ where
         PipelineControl::Stop
       }
       Err(main_err_from_scoped_pipeline) => {
-        // This is already MainErr
         event!(Level::ERROR, error = %main_err_from_scoped_pipeline, "Scoped pipeline execution failed.");
         // Deliberately skip the merge: a failed scope leaves the main context untouched.
-        return Err(main_err_from_scoped_pipeline); // Propagate the MainErr from the scoped pipeline
+        return Err(main_err_from_scoped_pipeline);
       }
     };
 
-    // 4. Fold the scoped context back into the main context, if a merge was configured.
     //    Both guards are taken and dropped inside this block; no `.await` happens here.
     if let Some(merge) = self.merge.as_ref() {
       event!(Level::TRACE, "Merging scoped context back into main context.");

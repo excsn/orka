@@ -1,3 +1,34 @@
+# Migrating Orka 0.2 → 0.3
+
+Two edits. The compiler finds the second one for you.
+
+## 1. Bump the requirement
+
+```toml
+orka = "^0.3"    # was "^0.2"
+```
+
+A caret on a `0.x` pins the minor, so the requirement has to move even though almost nothing
+you wrote does.
+
+## 2. `insert_before_step` / `insert_after_step` take `impl AsRef<str>`
+
+Their *new* step name went from `impl Into<String>` to `impl AsRef<str>`, so that a typed
+step key works on both arguments rather than only the first. String literals and `String`
+are unaffected. This bites only if you turbofished either call, which the compiler flags, or
+if you passed something that is `Into<String>` but not `AsRef<str>`, which in practice means
+`char`:
+
+```rust
+pipeline.insert_after_step("a", 'b');    // 0.2
+pipeline.insert_after_step("a", "b");    // 0.3
+```
+
+Everything else added in 0.3 is additive and needs no action. See `README.USAGE.md` for the
+narrative and `API_REFERENCE.md` for signatures.
+
+---
+
 # Migrating Orka 0.1 → 0.2
 
 0.2 is a breaking release. The changes are mechanical and the compiler catches nearly all of

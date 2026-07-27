@@ -1,15 +1,15 @@
 //! Provides authentication-related services like password hashing and verification.
 
-use crate::errors::AppError; // Application-specific error type
+use crate::errors::AppError;
 use argon2::{
   password_hash::{
-    rand_core::OsRng, // For generating random salts
+    rand_core::OsRng,
     PasswordHash,
-    PasswordHasher,   // The main trait for hashing
-    PasswordVerifier, // The main trait for verifying
+    PasswordHasher,
+    PasswordVerifier,
     SaltString,
   },
-  Argon2, // The Argon2 algorithm instance
+  Argon2,
 };
 use tracing::{debug, error, instrument};
 
@@ -31,13 +31,13 @@ pub fn hash_password(password: &str) -> Result<String, AppError> {
     ));
   }
 
-  let salt = SaltString::generate(&mut OsRng); // Generate a cryptographically secure random salt
-  let argon2_hasher = Argon2::default(); // Use default Argon2 parameters (recommended)
+  let salt = SaltString::generate(&mut OsRng);
+  let argon2_hasher = Argon2::default();
 
   match argon2_hasher.hash_password(password.as_bytes(), &salt) {
     Ok(password_hash_obj) => {
       debug!("Password hashed successfully.");
-      Ok(password_hash_obj.to_string()) // Convert the PasswordHash object to its string representation
+      Ok(password_hash_obj.to_string())
     }
     Err(argon_err) => {
       error!(error = %argon_err, "Argon2 password hashing failed.");
@@ -93,11 +93,11 @@ pub fn verify_password(hashed_password_str: &str, provided_password: &str) -> Re
   match argon2_verifier.verify_password(provided_password.as_bytes(), &parsed_hash) {
     Ok(()) => {
       debug!("Password verification successful: Passwords match.");
-      Ok(true) // Password matches
+      Ok(true)
     }
     Err(argon2::password_hash::Error::Password) => {
       debug!("Password verification failed: Passwords do not match.");
-      Ok(false) // Password does not match
+      Ok(false)
     }
     Err(other_argon_err) => {
       error!(error = %other_argon_err, "Argon2 password verification process encountered an error.");
@@ -110,7 +110,6 @@ pub fn verify_password(hashed_password_str: &str, provided_password: &str) -> Re
   }
 }
 
-// Placeholder for mock token generation/validation if you were building a full auth system.
 // For the current example, pipeline contexts will just hold a mock string token.
 /*
 #[instrument(name = "auth_service::generate_mock_token", fields(user_id = %user_id))]

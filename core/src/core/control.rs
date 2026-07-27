@@ -8,9 +8,6 @@ pub enum PipelineControl {
   /// Stop processing the current step immediately and halt the pipeline.
   /// No further handlers in the current step or subsequent steps will be executed.
   Stop,
-  // Potential future addition:
-  // /// Skip the remaining handlers (on, after) for the current step, but continue to the next step.
-  // SkipCurrentStepRest,
 }
 
 /// Outcome of a full pipeline execution.

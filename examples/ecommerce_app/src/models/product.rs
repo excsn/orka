@@ -7,7 +7,7 @@ use uuid::Uuid;
 pub struct Product {
   pub id: Uuid,
   pub name: String,
-  pub description: Option<String>, // Description can be optional
+  pub description: Option<String>,
   pub price_cents: i32,
   pub stock_quantity: i32,
   pub created_at: DateTime<Utc>,

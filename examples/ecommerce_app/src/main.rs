@@ -27,7 +27,7 @@ async fn main() -> std::io::Result<()> {
   tracing::info!("Starting e-commerce application server...");
 
   let app_config = match AppConfig::from_env() {
-    Ok(cfg) => Arc::new(cfg), // Arc the config for sharing
+    Ok(cfg) => Arc::new(cfg),
     Err(e) => {
       tracing::error!(error = %e, "Failed to load application configuration.");
       panic!("Configuration error: {}", e);

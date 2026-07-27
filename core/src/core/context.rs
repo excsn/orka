@@ -1,18 +1,14 @@
 //! Defines the `Handler<TData>` type for pipeline step handlers, operating on `ContextData<TData>`.
-//! Also includes (or will include) mechanisms for sub-context extraction.
+//! Also includes mechanisms for sub-context extraction.
 
-use crate::core::context_data::ContextData; // Import the new ContextData
+use crate::core::context_data::ContextData;
 use crate::core::control::PipelineControl;
 use crate::error::{OrkaError, OrkaResult};
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-// For potential AnyExtractor update:
-// use std::any::{Any, TypeId};
-// use std::sync::Arc;
 
-// --- Handler Definition ---
 
 /// Type alias for a pipeline step handler.
 ///
@@ -33,23 +29,17 @@ pub type Handler<TData, Err> = Box<
     + Sync,
 >;
 
-// --- Extractor Mechanism for Sub-Contexts SData from TData (using ContextData) ---
-// This section needs careful redesign if `Pipeline::on<S>` (for non-conditional sub-contexts)
-// is to be maintained and work with ContextData.
-//
-// Original idea:
-//   Extractor: Fn(&mut T) -> OrkaResult<&mut S>
-//
-// New idea with ContextData:
-//   Extractor: Fn(ContextData<TData>) -> OrkaResult<ContextData<SData>>
-//   This means SData gets its own independent ContextData wrapper.
-//
-// Or, if SData is just a part of TData and doesn't need its own independent lock:
-//   Extractor: Fn(ContextData<TData>) -> OrkaResult<SomePointerOrRefToPartOfTData>
-//   But then the sub-handler for S would still need the main ContextData<TData> to lock.
-//   The current pipeline.on<S> signature implies S has its own "context" for its handlers.
-//
-// Let's assume for now that if `on<S>` is used, `SData` gets its own `ContextData`.
+/// Type alias for a run-level finish handler registered via
+/// [`Pipeline::on_finish`](crate::Pipeline::on_finish).
+///
+/// Invoked, awaited, on every exit of a full `run()` with the final shared context and the
+/// run's [`RunOutcome`](crate::RunOutcome).
+pub type FinishHandler<TData, Err> = Box<
+  dyn Fn(ContextData<TData>, crate::core::trace::RunOutcome) -> Pin<Box<dyn Future<Output = Result<(), Err>> + Send>>
+    + Send
+    + Sync,
+>;
+
 
 /// Trait for a type-erased extractor that can get a sub-context `ContextData<SData>`
 /// from a root context `ContextData<TData>`.
@@ -98,12 +88,10 @@ pub type ExtractorFn<TData, SData> =
 /// A predicate over a context, used to decide whether a conditional scope should run.
 pub type ConditionFn<TData> = Arc<dyn Fn(ContextData<TData>) -> bool + Send + Sync + 'static>;
 
-// Concrete implementation of AnyContextDataExtractor.
 pub struct ContextDataExtractorImpl<
   TData: 'static + Send + Sync,
   SData: 'static + Send + Sync, // SData is the underlying data type for the sub-context
 > {
-  // The user-provided function to get ContextData<SData> from ContextData<TData>.
   extractor_fn: Arc<dyn Fn(ContextData<TData>) -> OrkaResult<ContextData<SData>> + Send + Sync + 'static>,
   // Optional write-back. `None` means the sub-context is detached (legacy behaviour).
   merge_fn: Option<MergeFn<TData, SData>>,
@@ -133,9 +121,7 @@ impl<TData: 'static + Send + Sync, SData: 'static + Send + Sync> AnyContextDataE
   for ContextDataExtractorImpl<TData, SData>
 {
   fn extract_sub_context_data(&self, root_ctx_data: ContextData<TData>) -> OrkaResult<Box<dyn Any + Send>> {
-    // Call the user's extractor function.
     let sub_ctx_data: ContextData<SData> = (self.extractor_fn)(root_ctx_data)?;
-    // Box it up into Box<dyn Any + Send>.
     Ok(Box::new(sub_ctx_data))
   }
 
@@ -173,11 +159,9 @@ impl<TData: 'static + Send + Sync, SData: 'static + Send + Sync> AnyContextDataE
   }
 }
 
-// Helper function to safely downcast the Box<dyn Any + Send> back to ContextData<SData>.
-// This is called within the wrapped Handler<TData> created by `Pipeline::on<SData>`.
 pub(crate) fn downcast_context_data<SData: 'static + Send + Sync>(
   any_ctx_data: Box<dyn Any + Send>,
-  expected_sdata_type_id: std::any::TypeId, // TypeId of SData (the inner type)
+  expected_sdata_type_id: std::any::TypeId,
   step_name: &str,
 ) -> OrkaResult<ContextData<SData>> {
   if std::any::TypeId::of::<SData>() != expected_sdata_type_id {
@@ -188,17 +172,12 @@ pub(crate) fn downcast_context_data<SData: 'static + Send + Sync>(
         std::any::type_name::<SData>(),
         std::any::TypeId::of::<SData>()
       ),
-      // We don't easily know the "actual" SData type from the Box<dyn Any> holding ContextData<ActualSData>
-      // without trying to downcast to ContextData<SomethingElse> first, which is complex.
-      // The expected_sdata_type_id comes from the registered extractor.
     });
   }
 
   match any_ctx_data.downcast::<ContextData<SData>>() {
-    Ok(boxed_ctx_data) => Ok(*boxed_ctx_data), // Unbox
+    Ok(boxed_ctx_data) => Ok(*boxed_ctx_data),
     Err(_) => {
-      // This should ideally not happen if TypeId matched, unless there's a logic error
-      // or the Box<dyn Any> didn't actually contain a ContextData<SData>.
       Err(OrkaError::Internal(format!(
               "Internal type mismatch during ContextData downcast for step '{}'. Expected ContextData<{}> but downcast failed despite TypeId match.",
               step_name,

@@ -2,7 +2,12 @@
 mod common;
 
 use common::*;
-use orka::{ContextData, Orka, OrkaError, Pipeline, PipelineControl, PipelineResult};
+use orka::test_util::MockPipeline;
+use orka::{
+  ContextData, Orka, OrkaError, Pipeline, PipelineControl, PipelineResult, PlannedAction, RunOutcome, SkipReason,
+  TraceCollector, TraceEventKind,
+};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RegistryContextAlpha {
@@ -114,4 +119,92 @@ async fn test_registry_with_orka_error_default() {
   let result = orka_registry.run(ctx.clone()).await;
   assert!(result.is_ok());
   assert_eq!(ctx.read().count, 1);
+}
+
+// --- Orka::pipeline() accessor: the registry as the test scope ---
+
+fn build_alpha_registry() -> Orka<TestError> {
+  // Stands in for an app's production registration fn: same wiring for tests and prod.
+  let orka_registry = Orka::<TestError>::new();
+  let mut p = Pipeline::<RegistryContextAlpha, TestError>::new(["prepare", "commit"]);
+  p.skip_if("prepare", |ctx| ctx.read().val == "already_prepared");
+  p.on_root("prepare", |ctx| async move {
+    ctx.write().val.push_str("prepared;");
+    Ok(PipelineControl::Continue)
+  })
+  .on_root("commit", |ctx| async move {
+    ctx.write().val.push_str("committed;");
+    Ok(PipelineControl::Continue)
+  })
+  .on_finish(|_ctx, _outcome| async { Ok(()) });
+  orka_registry.register_pipeline(p).unwrap();
+  orka_registry
+}
+
+#[tokio::test]
+async fn pipeline_accessor_returns_the_registered_pipeline() {
+  setup_tracing();
+  let orka_registry = build_alpha_registry();
+
+  let p = orka_registry
+    .pipeline::<RegistryContextAlpha, TestError>()
+    .expect("registered as a concrete pipeline");
+  assert_eq!(p.step_names(), vec!["prepare", "commit"]);
+
+  // Nothing registered for this TData.
+  #[derive(Clone, Debug, Default)]
+  struct NotRegistered;
+  assert!(orka_registry.pipeline::<NotRegistered, TestError>().is_none());
+}
+
+#[tokio::test]
+async fn pipeline_accessor_returns_none_for_runner_registrations_and_wrong_err() {
+  setup_tracing();
+  let orka_registry = Orka::<TestError>::new();
+  orka_registry.register_runner::<RegistryContextAlpha, TestError>(Arc::new(MockPipeline::completed()));
+  // Runner-only registration: no concrete pipeline to hand back.
+  assert!(orka_registry.pipeline::<RegistryContextAlpha, TestError>().is_none());
+
+  // A wrong Err type parameter yields None (failed downcast), never a panic.
+  let orka_registry2 = build_alpha_registry();
+  assert!(orka_registry2.pipeline::<RegistryContextAlpha, OrkaError>().is_none());
+}
+
+#[tokio::test]
+async fn observe_and_dry_run_the_registered_pipeline_through_the_front_door() {
+  setup_tracing();
+  let orka_registry = build_alpha_registry();
+  let p = orka_registry.pipeline::<RegistryContextAlpha, TestError>().unwrap();
+
+  // Dry-run the skip matrix against seeded contexts; nothing executes.
+  let plan = p.resolve_plan(&ContextData::new(RegistryContextAlpha {
+    val: "already_prepared".into(),
+  }));
+  assert_eq!(plan[0].action, PlannedAction::Skip(SkipReason::SkipCondition { label: None }));
+  assert_eq!(plan[1].action, PlannedAction::Run);
+
+  // Attach a tracer to the real registered pipeline, then drive the SAME entry point
+  // production uses: orka.run. FinalizerFinished proves the run-level cleanup ring is
+  // assertable through the front door.
+  let trace = TraceCollector::new();
+  p.set_tracer(trace.clone());
+
+  let ctx = ContextData::new(RegistryContextAlpha::default());
+  assert_eq!(orka_registry.run(ctx.clone()).await.unwrap(), PipelineResult::Completed);
+  assert_eq!(ctx.read().val, "prepared;committed;");
+
+  assert_eq!(trace.completed_steps(), vec!["prepare", "commit"]);
+  assert_eq!(trace.last_outcome(), Some(RunOutcome::Completed));
+  assert!(
+    trace
+      .events()
+      .iter()
+      .any(|e| matches!(e.kind, TraceEventKind::FinalizerFinished { .. })),
+    "on_finish ring must be visible through orka.run"
+  );
+
+  // Step isolation against the registered shape, still through the accessor.
+  let step_ctx = ContextData::new(RegistryContextAlpha::default());
+  p.run_step("commit", step_ctx.clone()).await.unwrap();
+  assert_eq!(step_ctx.read().val, "committed;");
 }
