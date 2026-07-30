@@ -72,7 +72,7 @@ async fn run_pipeline_with_handler_error() {
 
 async fn run_pipeline_with_framework_error() {
   // `step_beta_no_handler` is required but has no handler, so the run fails with
-  // `OrkaError::HandlerMissing` at the moment that step is reached — after the
+  // `OrkaError::HandlerMissing` at the moment that step is reached, after the
   // preceding steps have already run and committed their context changes.
   let mut pipeline = Pipeline::<ErrorContext, ExampleAppError>::new([
     "step_alpha",

@@ -5,7 +5,9 @@ mod common;
 
 use common::{setup_tracing, TestError};
 use orka::test_util::PipelineTestExt;
-use orka::{ContextData, FanOut, FanOutItemOutcome, FanOutPolicy, Pipeline, PipelineControl, PipelineResult};
+use orka::{
+  CancelToken, ContextData, FanOut, FanOutItemOutcome, FanOutPolicy, Pipeline, PipelineControl, PipelineResult,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -532,4 +534,173 @@ async fn the_shipped_tokio_spawner_works_out_of_the_box() {
   assert!(probe.peak() <= 3, "the cap still holds, saw {}", probe.peak());
   let ids: Vec<usize> = results.items().iter().map(|i| i.context.with_ref(|it| it.id)).collect();
   assert_eq!(ids, (0..9).collect::<Vec<_>>());
+}
+
+/// Cancelling stops new branches from starting but never drops one already running, so an
+/// in-flight branch still reaches its own finish ring.
+#[tokio::test]
+async fn cancelling_drains_in_flight_branches_instead_of_dropping_them() {
+  setup_tracing();
+  let finished = Arc::new(Mutex::new(Vec::<usize>::new()));
+  let token = CancelToken::new();
+
+  let canceller = token.clone();
+  let mut p: Pipeline<Item, TestError> = Pipeline::new(["work"]);
+  p.on_root("work", move |ctx: ContextData<Item>| {
+    let canceller = canceller.clone();
+    async move {
+      let (id, work_ms) = ctx.with_ref(|i| (i.id, i.work_ms));
+      // Cancelling after the sleep, so items 1 and 2 are already parked mid-handler and
+      // are genuinely in flight rather than merely allocated a slot.
+      tokio::time::sleep(Duration::from_millis(work_ms)).await;
+      if id == 0 {
+        canceller.cancel();
+      }
+      ctx.with_mut(|i| i.processed = true);
+      Ok(PipelineControl::Continue)
+    }
+  });
+
+  let recorder = finished.clone();
+  p.on_finish(move |ctx: ContextData<Item>, _outcome| {
+    let recorder = recorder.clone();
+    async move {
+      recorder.lock().unwrap().push(ctx.with_ref(|i| i.id));
+      Ok(())
+    }
+  });
+
+  let ladder = vec![
+    Item { id: 0, work_ms: 5, processed: false },
+    Item { id: 1, work_ms: 40, processed: false },
+    Item { id: 2, work_ms: 40, processed: false },
+    Item { id: 3, work_ms: 0, processed: false },
+    Item { id: 4, work_ms: 0, processed: false },
+  ];
+
+  let results = FanOut::new(Arc::new(p))
+    .with_cancel(token)
+    .max_concurrent(3)
+    .run(ladder)
+    .await;
+
+  assert!(results.was_cancelled());
+  assert_eq!(results.not_started(), 2, "items 3 and 4 never started");
+
+  let mut drained = finished.lock().unwrap().clone();
+  drained.sort();
+  assert_eq!(
+    drained,
+    vec![0, 1, 2],
+    "the three in-flight branches each ran their own finish ring"
+  );
+  assert!(
+    results.items()[1].context.with_ref(|i| i.processed),
+    "and an in-flight branch ran to its own end rather than being dropped"
+  );
+}
+
+/// The distinction a caller acts on: a branch that never started has nothing to tear down,
+/// one interrupted mid-run does.
+#[tokio::test]
+async fn cancelled_branches_are_reported_apart_from_never_started_ones() {
+  setup_tracing();
+  let token = CancelToken::new();
+  let canceller = token.clone();
+
+  let mut p: Pipeline<Item, TestError> = Pipeline::new(["register", "finish"]);
+  p.on_root("register", move |ctx: ContextData<Item>| {
+    let canceller = canceller.clone();
+    async move {
+      ctx.with_mut(|i| i.processed = true);
+      if ctx.with_ref(|i| i.id) == 0 {
+        canceller.cancel();
+      }
+      Ok(PipelineControl::Continue)
+    }
+  })
+  .on_root("finish", |_ctx: ContextData<Item>| async move {
+    Ok(PipelineControl::Continue)
+  });
+
+  let results = FanOut::new(Arc::new(p))
+    .with_cancel(token)
+    .max_concurrent(2)
+    .run(items(6, 0))
+    .await;
+
+  assert!(results.was_cancelled());
+  assert_eq!(results.cancelled(), 2, "both in-flight branches were interrupted");
+  assert_eq!(results.not_started(), 4);
+  assert_eq!(results.succeeded(), 0);
+  assert_eq!(results.failed(), 0);
+
+  assert!(
+    results.items()[0].context.with_ref(|i| i.processed),
+    "an interrupted branch did real work"
+  );
+  assert!(
+    !results.items()[5].context.with_ref(|i| i.processed),
+    "one that never started did not"
+  );
+}
+
+#[tokio::test]
+async fn a_cancelled_fanout_is_unmet_even_under_collect_all() {
+  setup_tracing();
+  let token = CancelToken::new();
+  token.cancel();
+
+  let results = FanOut::new(probed_pipeline(ConcurrencyProbe::default()))
+    .policy(FanOutPolicy::CollectAll)
+    .with_cancel(token)
+    .run(items(4, 0))
+    .await;
+
+  assert!(results.was_cancelled());
+  assert!(!results.satisfied(), "CollectAll claims everything ran, and it did not");
+  assert_eq!(results.not_started(), 4);
+  assert_eq!(
+    results.into_control().unwrap(),
+    PipelineControl::Stop,
+    "cancellation is an outcome, not a branch failure"
+  );
+}
+
+/// The case an ambient thread-local design would have missed: every branch is on its own
+/// task, so the token has to travel in the context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancellation_reaches_branches_running_on_their_own_tasks() {
+  setup_tracing();
+  let token = CancelToken::new();
+  let canceller = token.clone();
+
+  let mut p: Pipeline<Item, TestError> = Pipeline::new(["first", "second"]);
+  p.on_root("first", move |ctx: ContextData<Item>| {
+    let canceller = canceller.clone();
+    async move {
+      if ctx.with_ref(|i| i.id) == 0 {
+        canceller.cancel();
+      }
+      Ok(PipelineControl::Continue)
+    }
+  })
+  .on_root("second", |ctx: ContextData<Item>| async move {
+    ctx.with_mut(|i| i.processed = true);
+    Ok(PipelineControl::Continue)
+  });
+
+  let results = FanOut::new(Arc::new(p))
+    .spawner(Arc::new(orka::TokioSpawner))
+    .with_cancel(token)
+    .max_concurrent(2)
+    .run(items(6, 0))
+    .await;
+
+  assert!(results.was_cancelled());
+  assert_eq!(results.succeeded(), 0, "no branch got past its boundary check");
+  assert!(
+    results.items().iter().all(|i| !i.context.with_ref(|it| it.processed)),
+    "the second step never ran on any branch"
+  );
 }

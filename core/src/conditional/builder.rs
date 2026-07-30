@@ -261,7 +261,7 @@ where
   ///   .finalize_conditional_step(false);
   /// ```
   ///
-  /// The merge runs **only when the scoped pipeline succeeds** — a failed scope leaves the
+  /// The merge runs **only when the scoped pipeline succeeds**; a failed scope leaves the
   /// main context untouched.
   pub fn with_merge(mut self, merge_fn: impl Fn(&mut TData, &SData) + Send + Sync + 'static) -> Self {
     self.merge = Some(Arc::new(merge_fn));

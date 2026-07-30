@@ -8,7 +8,7 @@ struct BasicContext {
 }
 
 // This example uses `OrkaError` directly as its handler error type. Real applications
-// usually define their own error with `#[from] OrkaError` — see `error_handling.rs`.
+// usually define their own error with `#[from] OrkaError`; see `error_handling.rs`.
 #[tokio::main]
 async fn main() -> Result<(), OrkaError> {
   tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
@@ -54,6 +54,7 @@ async fn main() -> Result<(), OrkaError> {
   match result {
     PipelineResult::Completed => info!("Pipeline completed successfully!"),
     PipelineResult::Stopped => info!("Pipeline was stopped early."),
+    other => info!("Pipeline ended as {:?}.", other),
   }
 
   let final_context_state = pipeline_context.read();

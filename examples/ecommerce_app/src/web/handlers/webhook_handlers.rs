@@ -63,6 +63,13 @@ pub async fn generic_webhook_handler(
       );
       Ok(HttpResponse::Ok().json(serde_json::json!({"status": "acknowledged_stopped"})))
     }
+    Ok(other) => {
+      warn!(
+        "Webhook pipeline for source '{}' ended as {:?}.",
+        source_identifier, other
+      );
+      Ok(HttpResponse::Ok().json(serde_json::json!({"status": "acknowledged_incomplete"})))
+    }
     Err(app_err) => {
       error!(
         "Webhook pipeline for source '{}' failed: {:?}",

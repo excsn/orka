@@ -68,6 +68,15 @@ pub async fn signup_handler(
         "Signup process was halted by an internal step.".to_string(),
       ))
     }
+    Ok(other) => {
+      warn!(
+        "Signup pipeline for email {} ended as {:?}.",
+        req_payload.email, other
+      );
+      Err(AppError::Internal(
+        "Signup process did not run to completion.".to_string(),
+      ))
+    }
     Err(app_err) => {
       // AppError implements ResponseError, so Actix renders it directly.
       warn!(
@@ -133,6 +142,15 @@ pub async fn signin_handler(
       );
       Err(AppError::Auth(
         "Authentication process was unexpectedly halted.".to_string(),
+      ))
+    }
+    Ok(other) => {
+      warn!(
+        "Signin pipeline for email {} ended as {:?}.",
+        req_payload.email, other
+      );
+      Err(AppError::Auth(
+        "Authentication process did not run to completion.".to_string(),
       ))
     }
     Err(app_err) => {

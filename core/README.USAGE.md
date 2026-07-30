@@ -18,6 +18,7 @@ For signature-level detail see [API_REFERENCE.md](API_REFERENCE.md). For runnabl
 10. [Best Practices](#10-best-practices)
 11. [Run-Level Cleanup and Observation](#11-run-level-cleanup-and-observation)
 12. [Testing Your Pipelines](#12-testing-your-pipelines)
+13. [Cancelling a Run](#13-cancelling-a-run)
 
 ## 1. Core Concepts
 
@@ -25,9 +26,11 @@ For signature-level detail see [API_REFERENCE.md](API_REFERENCE.md). For runnabl
 
 **`ContextData<T>`** is `Arc<RwLock<T>>`. Cloning it shares the same underlying data. Lock guards from `read()` and `write()` are blocking and **must be dropped before any `.await`**.
 
-**Steps** each have three phases — `before`, `on`, `after` — and any number of handlers may be registered per phase. Handlers within a phase run in registration order.
+**Steps** each have three phases (`before`, `on`, `after`), and any number of handlers may be registered per phase. Handlers within a phase run in registration order.
 
-**`PipelineControl`** is what a handler returns to steer execution: `Continue` or `Stop`. **`PipelineResult`** is the outcome of a whole run: `Completed` or `Stopped`.
+**`PipelineControl`** is what a handler returns to steer execution: `Continue` or `Stop`. **`PipelineResult`** is the outcome of a whole run: `Completed`, `Stopped`, or `Cancelled`.
+
+**`CancelToken`** lets something outside a run wind it down. See [Cancelling a Run](#13-cancelling-a-run).
 
 **Conditional scopes** let one step dispatch to one of several sub-pipelines (`Pipeline<SData, Err>`) chosen by runtime predicates.
 
@@ -88,13 +91,14 @@ async fn main() -> Result<(), ReportError> {
   match pipeline.run(ctx.clone()).await? {
     PipelineResult::Completed => println!("completed"),
     PipelineResult::Stopped => println!("stopped early"),
+    other => println!("ended as {other:?}"),
   }
 
   Ok(())
 }
 ```
 
-`Pipeline::new` takes step names in execution order and accepts anything iterable of string-likes — `&["a", "b"]`, `["a", "b"]`, or a `Vec<String>` built at runtime:
+`Pipeline::new` takes step names in execution order and accepts anything iterable of string-likes: `&["a", "b"]`, `["a", "b"]`, or a `Vec<String>` built at runtime:
 
 ```rust
 let names: Vec<String> = config.stages.iter().map(|s| s.name.clone()).collect();
@@ -234,14 +238,14 @@ Returning `Err(..)` aborts the run and propagates the error out of `run`.
 `ContextData` guards are blocking. Never hold one across a suspension point:
 
 ```rust
-// Wrong — guard is live across the await.
+// Wrong: guard is live across the await.
 .on_root("fetch", |ctx| async move {
   let mut data = ctx.write();
   data.body = http::get(&data.url).await?;
   Ok(PipelineControl::Continue)
 })
 
-// Right — read what you need, drop the guard, then await.
+// Right: read what you need, drop the guard, then await.
 .on_root("fetch", |ctx| async move {
   let url = ctx.read().url.clone();
   let body = http::get(&url).await?;
@@ -311,7 +315,7 @@ pipeline
   });
 ```
 
-The merge runs with a write lock on the root and a read lock on the sub-context, and **only when the sub-handler returns `Ok`** — a failed sub-handler leaves the root untouched.
+The merge runs with a write lock on the root and a read lock on the sub-context, and **only when the sub-handler returns `Ok`**; a failed sub-handler leaves the root untouched.
 
 Use the detached form when the sub-pipeline only reads, or when you deliberately want its mutations discarded. Use the merging form whenever its results matter. `examples/sub_context.rs` runs both side by side.
 
@@ -345,11 +349,11 @@ pipeline
   .finalize_conditional_step(false);
 ```
 
-The chain reads: add a scope, optionally attach a merge, give it a condition, repeat. `.with_merge(..)` goes between `add_static_scope`/`add_dynamic_scope` and `on_condition`. Without it, the scope is detached exactly like a plain `set_extractor` — the sub-pipeline works on its own context and the main context sees nothing of it. With it, the sub-context is folded back after the scoped pipeline succeeds.
+The chain reads: add a scope, optionally attach a merge, give it a condition, repeat. `.with_merge(..)` goes between `add_static_scope`/`add_dynamic_scope` and `on_condition`. Without it, the scope is detached exactly like a plain `set_extractor`: the sub-pipeline works on its own context and the main context sees nothing of it. With it, the sub-context is folded back after the scoped pipeline succeeds.
 
 ### Dynamic scopes
 
-Use `add_dynamic_scope` when the sub-pipeline must be built per run — from a lookup, a tenant config, or anything else async:
+Use `add_dynamic_scope` when the sub-pipeline must be built per run, from a lookup, a tenant config, or anything else async:
 
 ```rust
 async fn tenant_pipeline(
@@ -373,11 +377,11 @@ pipeline
 
 ### Finalizing
 
-`finalize_conditional_step(optional_for_main_step)` **must** terminate the chain — the collected scopes are discarded otherwise. Its argument sets the step's optionality: pass `true` and errors from a matched scope are swallowed and the pipeline continues; pass `false` and they propagate. `Pipeline::validate` reports a builder you forgot to finalize.
+`finalize_conditional_step(optional_for_main_step)` **must** terminate the chain, or the collected scopes are discarded. Its argument sets the step's optionality: pass `true` and errors from a matched scope are swallowed and the pipeline continues; pass `false` and they propagate. `Pipeline::validate` reports a builder you forgot to finalize.
 
 The step is created automatically if it does not already exist. Conditional scopes **append** their handler, so `on_root` handlers already registered on the same step still run.
 
-`if_no_scope_matches(..)` sets what happens when no condition holds — `PipelineControl::Continue` by default.
+`if_no_scope_matches(..)` sets what happens when no condition holds: `PipelineControl::Continue` by default.
 
 ### Fan-out: running one pipeline over many items
 
@@ -414,7 +418,9 @@ Each branch is a full `Pipeline::run`, so every item gets its own `on_finish` ri
 
 `custom_policy(|results| ...)` covers what the four cannot ("satisfied if the primary region succeeded"). `into_control()` turns the verdict into a handler's return: `Ok(Continue)` when satisfied, otherwise the first branch's typed error, or `OrkaError::FanOutPolicyUnmet` when the policy is unmet without any branch having failed.
 
-`FailFast` is the only policy that acts before every branch settles, and it **stops starting new branches rather than cancelling in-flight ones**. Cancelling would mean dropping a running pipeline mid-flight, whose `on_finish` handlers would never fire and whose resources would release late, which is precisely the cleanup this engine exists to make reliable. Branches that never started are reported as `NotStarted` and have run no code at all.
+`FailFast` is the only policy that acts before every branch settles, and it **stops starting new branches rather than dropping in-flight ones**. Dropping a running pipeline mid-flight would mean its `on_finish` handlers never fire and its resources release late, which is precisely the cleanup this engine exists to make reliable. Branches that never started are reported as `NotStarted` and have run no code at all.
+
+`FanOut::with_cancel(token)` is that same wind-down reached from outside rather than from a branch failure, and it works under every policy. See [Cancelling a run](#13-cancelling-a-run).
 
 **By default, concurrency here is cooperative rather than parallel.** orka depends on no async runtime, so branches are polled on the caller's task and make progress while each other awaits. That fits I/O-bound work (network calls, uploads, waiting on a remote event), which is the usual shape of per-item fan-out. A branch that blocks the thread, whether by a synchronous file read, a long CPU stretch, or a lock guard held across a yield point, stalls its siblings.
 
@@ -455,7 +461,7 @@ let outcome = orka.run(ctx.clone()).await?;
 
 `register_pipeline` validates the pipeline and returns `OrkaResult<()>`, so setup mistakes surface at registration rather than on the first run. Pipelines are keyed by `TData`, so registering a second pipeline for the same context type replaces the first.
 
-`ApplicationError` must be `From<OrkaError>` and `From<PipelineHandlerError>` for every pipeline registered — the registry converts each pipeline's error into the application error. When your handlers use `OrkaError` directly, `Orka::new_default()` is a convenience constructor for `Orka<OrkaError>`.
+`ApplicationError` must be `From<OrkaError>` and `From<PipelineHandlerError>` for every pipeline registered, since the registry converts each pipeline's error into the application error. When your handlers use `OrkaError` directly, `Orka::new_default()` is a convenience constructor for `Orka<OrkaError>`.
 
 `Orka::run` looks up the pipeline by the type of the context you hand it. If nothing is registered for that type it returns `OrkaError::ConfigurationError`.
 
@@ -463,13 +469,13 @@ let outcome = orka.run(ctx.clone()).await?;
 
 Orka splits setup mistakes into two categories.
 
-**Panics** — programming errors caught immediately at the call that made them:
+**Panics**, for programming errors caught immediately at the call that made them:
 
 *   Referring to a step name that does not exist (`on_root("typo", ..)`).
 *   Declaring the same step name twice in `Pipeline::new`, or inserting a step that already exists.
 *   Registering `on::<SData>` for a step with no extractor.
 
-**`validate()`** — problems that are only visible once the whole pipeline is assembled:
+**`validate()`**, for problems that are only visible once the whole pipeline is assembled:
 
 ```rust
 pipeline.validate()?;
@@ -481,7 +487,7 @@ It reports:
 2.  An extractor registered for a step that has no `on::<SData>` handler consuming it.
 3.  A `conditional_scopes_for_step` builder that was never finalized, so its scopes were silently discarded.
 
-All problems are collected into a single `OrkaError::ConfigurationError`, not just the first. Calling `validate` yourself is optional — `Orka::register_pipeline` runs it for you — but it is worth doing in a test when you run pipelines directly via `Pipeline::run`.
+All problems are collected into a single `OrkaError::ConfigurationError`, not just the first. Calling `validate` yourself is optional, since `Orka::register_pipeline` runs it for you, but it is worth doing in a test when you run pipelines directly via `Pipeline::run`.
 
 ## 9. Error Handling
 
@@ -541,12 +547,14 @@ pipeline.on_root(Step::AwaitArtifact, |ctx| async move {
 
 The budget bounds **that await only**, not the rest of the handler, which is usually what you want: the call that may never return is a specific one, and keeping the timeout local means you can still react to it (publish a message, fall back, retry) rather than only fail. Where no wrapper fits at all, such as a poll loop with its own deadline or a callee that takes the timeout as a parameter, returning `StepTimedOut` by hand still buys the uniform reporting.
 
-One caveat worth stating: a timeout drops the handler future, so whatever it had in flight is abandoned mid-way. The run itself continues to its exit, so the `on_finish` ring still fires and the resource bag still releases; it is only the step's own partial work that is lost. That is inherent to timeouts, and it is why fan-out's `FailFast` drains instead of cancelling: a timeout is a hard bound, whereas fail-fast is an optimisation.
+One caveat worth stating: a timeout drops the handler future, so whatever it had in flight is abandoned mid-way. The run itself continues to its exit, so the `on_finish` ring still fires and the resource bag still releases; it is only the step's own partial work that is lost. That is inherent to timeouts, and it is why fan-out's `FailFast` drains instead of dropping: a timeout is a hard bound, whereas fail-fast is an optimisation.
+
+Cancellation sits on the drain side of that line too. It never drops a future, which is why it needs a handler's cooperation to interrupt a long await; see [Cancelling a run](#13-cancelling-a-run).
 
 ### Propagation rules
 
 *   A handler error aborts the run and propagates out of `Pipeline::run`.
-*   A failing sub-handler skips the merge — the root context is left untouched.
+*   A failing sub-handler skips the merge, leaving the root context untouched.
 *   A failing conditional scope propagates unless the step is optional, in which case the error is logged and the pipeline continues.
 *   Extractor and provider failures are `OrkaError`s converted into the pipeline's `Err` via `From`.
 
@@ -713,3 +721,94 @@ orka.register_runner::<CheckoutCtx, AppError>(Arc::new(mock));
 ### Injection seams for scopes and extractors
 
 `add_scope_with_provider(Arc<dyn PipelineProvider<..>>, extractor)` is the trait-object generalization of `add_static_scope`/`add_dynamic_scope`, so a test can inject a recording or canned provider. `set_extractor_impl(step, Arc<dyn AnyContextDataExtractor<..>>)` is the same seam behind `set_extractor`/`set_extractor_with_merge`. For counting invocations of providers, extractors, or handlers, clone a `test_util::ExecutionCounter` into the closure and assert locally; no global state, no serial tests.
+
+## 13. Cancelling a Run
+
+`PipelineControl::Stop` is in-band: only the handler currently executing can end a run. It cannot express "the operator hit Ctrl-C", "the supervising task gave up", or "the parent deploy was cancelled, so stop this branch". A `CancelToken` is the out-of-band counterpart.
+
+```rust
+let token = CancelToken::new();
+
+let watcher = token.clone();
+tokio::spawn(async move {
+  shutdown.recv().await;
+  watcher.cancel();
+});
+
+let (result, outcome) = orka.run_with_cancel_and_outcome(ctx, token).await;
+```
+
+There is a matching pair on `Pipeline` (`run_with_cancel`, `run_with_cancel_and_outcome`, `run_with_observer_and_cancel`) and on `Orka` (`run_with_cancel`, `run_with_cancel_and_outcome`). Most callers reach a pipeline through the registry, and the registry forms need no extra plumbing: the token rides inside the context, which is exactly what the registry already erases and passes through.
+
+### What a cancelled run does
+
+It stops before starting its next step, and then takes the **ordinary exit**. The `on_finish` ring fires in full and the resource bag releases, identically to a completed run. That is the entire point: cancellation here is a wind-down, not an abort, so the cleanup this engine exists to make reliable still happens.
+
+The outcome is `RunOutcome::Cancelled` rather than `Stopped`, and the two are kept apart because they call for opposite handling:
+
+```rust
+pipeline.on_finish(|ctx, outcome| async move {
+  if !matches!(outcome, RunOutcome::Completed) {
+    discard_half_built_release(&ctx).await?;   // covers Cancelled and Errored alike
+  }
+  Ok(())
+});
+```
+
+Folding cancellation into `Stopped` would make a cancelled deploy read as a clean early exit and leave its release on disk. A finalizer that compensates a half-applied change needs to know the run was interrupted, not that it finished early on purpose.
+
+The trace records where it landed. `TraceEventKind::RunCancelled { step, index }` names the step the run was about to start, which is the post-mortem answer to how far it got, followed by `RunFinished { outcome: Cancelled }` after the finalizers.
+
+### Cancelling a long await
+
+The engine polls the token at every **step boundary**, so a handler that does nothing gets cancellation with a latency of one step. That is fine for short steps and useless for a handler parked on a three-minute wait. `ctx.cancellation()` is always available, so such a handler can race the token against its own work:
+
+```rust
+pipeline.on_root("await-completion", |ctx| async move {
+  tokio::select! {
+    _ = ctx.cancellation().cancelled() => Ok(PipelineControl::Stop),
+    r = orka::timed("await-completion", Duration::from_secs(180), rx.recv()) => {
+      ctx.write().outcome = r?;
+      Ok(PipelineControl::Continue)
+    }
+  }
+});
+```
+
+Returning `Stop` is all a handler has to do. Because the token is set, the run reports `Cancelled` rather than `Stopped`, so there is no separate control signal to learn. (The cost of that rule: a handler stopping for its own unrelated reasons during a cancellation also reports as cancelled.)
+
+A context that was never given a token still has one, permanently unset, so this code compiles and behaves sensibly under a plain `run()`: `cancelled()` simply never resolves and the `select!` degrades to its other arm.
+
+### Cancelling a fan-out
+
+```rust
+let results = FanOut::new(deploy_pipeline.clone())
+  .with_cancel(ctx.cancellation())
+  .max_concurrent(8)
+  .run(placements)
+  .await;
+```
+
+Passing the enclosing run's own token is the usual call: cancelling the parent then cancels the orchestration it started. New branches stop starting, in-flight ones drain, and the token is installed into each branch's context so every branch winds down at its own next step boundary with its own `on_finish` ring intact.
+
+The result tells the two cases apart, which matters whenever a branch registers work that outlives it:
+
+```rust
+for item in results.items() {
+  match &item.outcome {
+    FanOutItemOutcome::Cancelled => stop_job(item.index).await?,  // it got far enough to register
+    FanOutItemOutcome::NotStarted => {}                           // nothing exists to tear down
+    _ => {}
+  }
+}
+```
+
+It also changes what you can tell an operator: "3 interrupted mid-deploy" rather than "3 never started".
+
+A cancelled fan-out is unmet under every built-in policy, `CollectAll` included, and `into_control()` returns `Ok(Stop)` rather than an error. Cancellation is an outcome, not a failure.
+
+### The two limits
+
+**Cancellation during the finish ring is ignored.** The ring is the cleanup a cancelled run exists to reach; interrupting it would strand exactly the drains, locks and half-built artifacts the finalizers are there to unwind. This is a guarantee, not an oversight.
+
+**A handler that blocks forever still blocks forever.** Cancellation bounds *starting* work, not *finishing* it. Orka has no timer and never drops a running future. Where you need a hard bound on a single await rather than a cooperative one, that is what `orka::timed` is for.

@@ -1,6 +1,7 @@
 //! A bounded-concurrency joiner over boxed futures, written by hand because orka depends
 //! on no async utility crate and cannot spawn.
 
+use crate::core::cancel::CancelToken;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -36,13 +37,21 @@ pub(crate) struct BoundedJoin<T> {
   /// Set once `stop_on` trips: no further branches start, but in-flight ones drain.
   stop_starting: bool,
   stop_on: Option<StopPredicate<T>>,
+  /// Governs starting exactly as `stop_starting` does, but is set from outside rather than
+  /// by a finished branch.
+  cancel: Option<CancelToken>,
 }
 
 impl<T> BoundedJoin<T> {
   /// # Panics
   /// Panics if `limit` is zero, which would be a setup error that could never make
   /// progress.
-  pub(crate) fn new(futures: Vec<BranchFuture<T>>, limit: usize, stop_on: Option<StopPredicate<T>>) -> Self {
+  pub(crate) fn new(
+    futures: Vec<BranchFuture<T>>,
+    limit: usize,
+    stop_on: Option<StopPredicate<T>>,
+    cancel: Option<CancelToken>,
+  ) -> Self {
     assert!(limit > 0, "Orka setup error: fan-out concurrency limit must be at least 1.");
     let count = futures.len();
     let mut results = Vec::with_capacity(count);
@@ -55,7 +64,12 @@ impl<T> BoundedJoin<T> {
       limit,
       stop_starting: false,
       stop_on,
+      cancel,
     }
+  }
+
+  fn cancelled(&self) -> bool {
+    self.cancel.as_ref().is_some_and(|c| c.is_cancelled())
   }
 }
 
@@ -78,7 +92,9 @@ impl<T> Future for BoundedJoin<T> {
     // waker, so filling a freed slot and returning `Pending` without polling the newcomer
     // would park the whole join forever.
     loop {
-      while !this.stop_starting && this.active.len() < this.limit && this.next < this.futures.len() {
+      let halted = this.stop_starting || this.cancelled();
+
+      while !halted && this.active.len() < this.limit && this.next < this.futures.len() {
         this.active.push(this.next);
         this.next += 1;
       }
@@ -107,15 +123,18 @@ impl<T> Future for BoundedJoin<T> {
         }
       }
 
-      if this.active.is_empty() && (this.stop_starting || this.next >= this.futures.len()) {
+      // Recomputed rather than reusing `halted`: a branch finishing in the round above can
+      // trip `stop_on`, and another task can cancel while this round runs.
+      let halted = this.stop_starting || this.cancelled();
+
+      if this.active.is_empty() && (halted || this.next >= this.futures.len()) {
         return Poll::Ready(std::mem::take(&mut this.results));
       }
 
       // Go round again only when a completion actually freed a slot there is work to
       // fill, which is the case where a newcomer still needs its first poll. Otherwise
       // every live branch has registered its waker and there is nothing more to do.
-      let can_start_more =
-        !this.stop_starting && this.next < this.futures.len() && this.active.len() < this.limit;
+      let can_start_more = !halted && this.next < this.futures.len() && this.active.len() < this.limit;
       if !(completed_any && can_start_more) {
         return Poll::Pending;
       }

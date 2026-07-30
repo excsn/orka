@@ -1,12 +1,12 @@
 # Orka: The Orchestration Kernel
 
-**Orka is a workflow orchestration engine for complex, multi-step business processes — the kind that outgrow a request-response handler but don't warrant standing up a separate workflow service.**
+**Orka is a workflow orchestration engine for complex, multi-step business processes, the kind that outgrow a request-response handler but don't warrant standing up a separate workflow service.**
 
 A process is modelled as an explicit pipeline of named steps operating on shared, typed state, with conditional branching, async-native execution, and one consistent error strategy throughout. The payoff is that the shape of a process is readable from its definition, rather than inferred from tangled call sites.
 
 ## Vision
 
-To make complex, stateful, multi-step operations as clear to define and reason about as a single function — through a small set of primitives that hold up across languages and scale from one service to a distributed system.
+To make complex, stateful, multi-step operations as clear to define and reason about as a single function, through a small set of primitives that hold up across languages and scale from one service to a distributed system.
 
 ## The Challenge: Managing Complex Processes
 
@@ -24,7 +24,7 @@ Implementing such processes directly within application code can lead to tangled
 
 Orka structures these processes around a few principles:
 
-*   **Pipelines as First-Class Citizens:** Processes are explicitly defined as "pipelines" – ordered sequences of distinct, named steps.
+*   **Pipelines as First-Class Citizens:** Processes are explicitly defined as "pipelines": ordered sequences of distinct, named steps.
 *   **Decoupled Step Logic:** Each step's business logic is encapsulated, promoting modularity and testability.
 *   **Managed Shared State:** Pipelines operate on a well-defined shared context (or state object) that evolves through the pipeline, with mechanisms for safe concurrent access if needed.
 *   **Conditional Branching:** The framework provides robust mechanisms for conditional execution paths, allowing pipelines to adapt dynamically to different inputs or states. This can involve dispatching to specialized sub-pipelines or alternative steps.
@@ -67,7 +67,7 @@ Orka is well-suited for a variety of applications where multi-step processes are
 
 ## Implementations
 
-*   [**Orka for Rust (`orka`)**](./core) — available now.
+*   [**Orka for Rust (`orka`)**](./core): available now.
     *   Type-safe and asynchronous. Pipelines are generic over both their context data and their error type, so step handlers integrate directly with an application's own error enum. Shared state lives in `ContextData<T>` (`Arc<RwLock<T>>`), and conditional branching dispatches to fully typed sub-pipelines operating on extracted sub-contexts.
     *   See [`core/README.md`](./core/README.md) to get started.
 

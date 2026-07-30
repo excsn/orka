@@ -85,13 +85,14 @@ async fn main() -> Result<(), AppError> {
   match orka.run(ctx.clone()).await? {
     PipelineResult::Completed => println!("done, paid = {}", ctx.read().paid),
     PipelineResult::Stopped => println!("stopped early"),
+    other => println!("ended as {other:?}"),
   }
 
   Ok(())
 }
 ```
 
-Step names come first; optionality and skip conditions are chained afterwards. Every registration method returns `&mut Self`, so setup reads as one chain. Handlers are plain `async move` blocks returning `Result<PipelineControl, Err>` — no `Box::pin`, no turbofish.
+Step names come first; optionality and skip conditions are chained afterwards. Every registration method returns `&mut Self`, so setup reads as one chain. Handlers are plain `async move` blocks returning `Result<PipelineControl, Err>`, with no `Box::pin` and no turbofish.
 
 ## Documentation
 
@@ -103,7 +104,7 @@ Step names come first; optionality and skip conditions are chained afterwards. E
 
 ## Contributing
 
-Contributions are welcome — bug reports, feature suggestions, documentation improvements, or code. Open an issue or pull request on [GitHub](https://github.com/excsn/orka).
+Contributions are welcome: bug reports, feature suggestions, documentation improvements, or code. Open an issue or pull request on [GitHub](https://github.com/excsn/orka).
 
 ## License
 

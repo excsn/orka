@@ -136,6 +136,10 @@ where
       }
     };
 
+    // The extractor built an independent context, so the scoped run would otherwise be
+    // uncancellable from the parent.
+    sub_sdata_ctx.install_cancellation(main_ctx_data.cancellation());
+
     event!(Level::DEBUG, "Running scoped pipeline.");
     let control = match scoped_pipeline_instance.run(sub_sdata_ctx.clone()).await {
       Ok(crate::core::control::PipelineResult::Completed) => {
@@ -144,6 +148,10 @@ where
       }
       Ok(crate::core::control::PipelineResult::Stopped) => {
         event!(Level::INFO, "Scoped pipeline was stopped by one of its handlers.");
+        PipelineControl::Stop
+      }
+      Ok(crate::core::control::PipelineResult::Cancelled) => {
+        event!(Level::INFO, "Scoped pipeline was cancelled.");
         PipelineControl::Stop
       }
       Err(main_err_from_scoped_pipeline) => {

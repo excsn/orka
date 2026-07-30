@@ -41,7 +41,8 @@ Orka is an asynchronous, pluggable, and type-safe workflow engine for Rust. It a
 *   **`OrkaResult<T, E = OrkaError>` (Type Alias):** Orka's standard `Result`, defaulting to `OrkaError`.
 *   **`ContextData<T>`:** Used for passing shared state to handlers.
 *   **`PipelineControl` (Enum):** Returned by handlers to signal continue or stop.
-*   **`PipelineResult` (Enum):** The outcome of a full run (`Completed` or `Stopped`).
+*   **`PipelineResult` (Enum):** The outcome of a full run (`Completed`, `Stopped`, or `Cancelled`).
+*   **`CancelToken`:** Out-of-band cancellation, for anything that is not the running handler. Section 10.
 *   **`From<OrkaError>` Trait Bound:** Required for application error types used with `Pipeline` or `Orka`.
 *   **Step names (`impl AsRef<str>`):** Every parameter naming a step accepts anything `AsRef<str>`: a `&str` literal, a `String`, or a typed key. Giving a step enum an `AsRef<str>` impl makes step references typo-proof, rename-refactorable, and autocompleting; typed keys and strings mix freely.
 
@@ -74,7 +75,7 @@ All configuration and registration methods return `&mut Self`, so calls chain.
 
 *   **`pub fn new<I, S>(step_names: I) -> Self`**
     *   Where `I: IntoIterator<Item = S>`, `S: AsRef<str>`.
-    *   Creates a pipeline from an ordered list of step names — `&["a", "b"]`, `["a", "b"]`, or `Vec<String>`.
+    *   Creates a pipeline from an ordered list of step names: `&["a", "b"]`, `["a", "b"]`, or `Vec<String>`.
     *   Every step starts **required** with no skip condition.
     *   **Panics** if the same step name appears twice.
 
@@ -224,7 +225,7 @@ A wrapper for shared context data using `Arc<RwLock<T>>`.
 
 *   **`pub fn project<U, F>(&self, get: F) -> ContextData<U>`**
     *   Where `U: Send + Sync + 'static`, `F: FnOnce(&T) -> U`.
-    *   Builds a *new, independent* `ContextData<U>` from a projection of this one — the common shape of a sub-context extractor. The read guard is released before returning, so the result is safe to hold across an `.await`.
+    *   Builds a *new, independent* `ContextData<U>` from a projection of this one, the common shape of a sub-context extractor. The read guard is released before returning, so the result is safe to hold across an `.await`.
     *   The result does **not** share state with `self`; pair it with `set_extractor_with_merge` (or a scope's `with_merge`) to propagate writes back.
 
     ```rust
@@ -336,8 +337,8 @@ Defines a contract for objects that can provide scoped pipeline instances.
 
 **Implementors:**
 
-*   `StaticPipelineProvider<SData, Err>` — yields a pre-built pipeline.
-*   `FunctionalPipelineProvider<TData, SData, Err, F, Fut>` — yields a pipeline from an async factory.
+*   `StaticPipelineProvider<SData, Err>`: yields a pre-built pipeline.
+*   `FunctionalPipelineProvider<TData, SData, Err, F, Fut>`: yields a pipeline from an async factory.
 
 Both are re-exported at the crate root.
 
@@ -350,16 +351,19 @@ Signal from a handler indicating whether the pipeline should continue or stop.
 **Variants:**
 
 *   **`Continue`**: Proceed with the current step and subsequent steps.
-*   **`Stop`**: Halt immediately — no further handlers in the current step, no further steps.
+*   **`Stop`**: Halt immediately, with no further handlers in the current step and no further steps.
 
 ### Enum `orka::core::control::PipelineResult`
 
 Outcome of a full pipeline execution.
 
+Marked `#[non_exhaustive]`: match it with a wildcard arm.
+
 **Variants:**
 
 *   **`Completed`**: All non-skipped steps ran to completion.
 *   **`Stopped`**: A handler returned `PipelineControl::Stop`.
+*   **`Cancelled`**: The run reached a step boundary with its `CancelToken` set. See section 10.
 
 ## 5. Public Type Aliases
 
@@ -399,7 +403,7 @@ The framework's error type.
 
 **Conversions:**
 
-*   **`impl From<anyhow::Error> for OrkaError`** — wraps as `HandlerError`. An `anyhow::Error` already wrapping an `OrkaError` stays nested; the causal chain is preserved via `#[source]`.
+*   **`impl From<anyhow::Error> for OrkaError`**: wraps as `HandlerError`. An `anyhow::Error` already wrapping an `OrkaError` stays nested; the causal chain is preserved via `#[source]`.
 
 **Standard Result Type:**
 
@@ -529,7 +533,7 @@ Runs one pipeline over every item of a runtime collection. The counterpart to `c
 *   **`pub fn policy(self, policy: FanOutPolicy) -> Self`**
 *   **`pub fn custom_policy(self, is_satisfied: impl Fn(&FanOutResults<SData, Err>) -> bool + Send + Sync + 'static) -> Self`**
     *   Replaces any built-in policy. Evaluated once after every branch has settled, so unlike `FailFast` it cannot stop branches from starting.
-*   **`pub fn max_concurrent(self, n: usize) -> Self`** — **Panics** if `n` is zero.
+*   **`pub fn max_concurrent(self, n: usize) -> Self`**. **Panics** if `n` is zero.
 *   **`pub fn spawner(self, spawner: Arc<dyn TaskSpawner>) -> Self`**
     *   Runs each branch as a task on your executor instead of cooperatively on the caller's task. See "Spawning" below.
 *   **`pub async fn run<I: IntoIterator<Item = SData>>(&self, items: I) -> FanOutResults<SData, Err>`**
@@ -548,17 +552,89 @@ Concurrency is **cooperative by default**: orka depends on no async runtime, so 
 
 `FailFast` | `CollectAll` | `RequireAll` | `RequireAtLeast(usize)`. `Clone + Debug + PartialEq + Eq + Display`. Policies decide only whether the fan-out is *satisfied*; they never discard results.
 
-`FailFast` is the only policy that acts before all branches settle, and it stops *starting* new branches while letting in-flight ones drain. It deliberately does not cancel: a dropped mid-run branch would skip its `on_finish` handlers and release its resources late.
+`FailFast` is the only policy that acts before all branches settle, and it stops *starting* new branches while letting in-flight ones drain. It deliberately does not drop a running branch, which would skip its `on_finish` handlers and release its resources late. `FanOut::with_cancel` (section 10) is that same wind-down reached from outside rather than from a branch failure, and it composes with every policy.
 
 ### Results
 
-*   **`pub enum FanOutItemOutcome<Err>`**: `Completed(PipelineResult)` (ran without error, whether its pipeline completed or stopped) | `Failed(Err)` (the branch's own **typed** error, not stringified) | `NotStarted` (FailFast tripped first; the branch ran no code and its context holds the untouched input). Helpers `is_success`, `is_failure`, `is_not_started`.
+*   **`pub enum FanOutItemOutcome<Err>`**: `Completed(PipelineResult)` (ran without error, whether its pipeline completed or stopped) | `Failed(Err)` (the branch's own **typed** error, not stringified) | `Cancelled` (started, then interrupted mid-run by `with_cancel`) | `NotStarted` (FailFast or a cancellation tripped first; the branch ran no code and its context holds the untouched input). Helpers `is_success`, `is_failure`, `is_cancelled`, `is_not_started`. Marked `#[non_exhaustive]`.
 *   **`pub struct FanOutItem<SData, Err> { pub index: usize, pub context: ContextData<SData>, pub outcome: FanOutItemOutcome<Err> }`**
 *   **`pub struct FanOutResults<SData, Err>`**, always in **input order** regardless of completion order:
     *   `items() -> &[FanOutItem<SData, Err>]`, `len()`, `is_empty()`
-    *   `succeeded()`, `failed()`, `stopped()` (a subset of succeeded), `not_started()`
+    *   `succeeded()`, `failed()`, `stopped()` (a subset of succeeded), `cancelled()`, `not_started()`
+    *   `was_cancelled() -> bool`: whether the fan-out's token fired. Separate from `cancelled()` being non-zero, because a fan-out cancelled before any branch started has zero cancelled branches and every branch `NotStarted`.
     *   `oks() -> impl Iterator<Item = &ContextData<SData>>`, `cloned_oks() -> Vec<SData>` where `SData: Clone`
-    *   `errors() -> impl Iterator<Item = (usize, &Err)>` — each failure with its **input index**, so callers can report which item failed rather than only how many
+    *   `errors() -> impl Iterator<Item = (usize, &Err)>`: each failure with its **input index**, so callers can report which item failed rather than only how many
     *   `policy()`, `satisfied()`
-    *   `into_first_error(self) -> Option<Err>` and `into_control(self) -> Result<PipelineControl, Err>` (consuming, since `Err` need not be `Clone`; read what you need first). `into_control` returns `Ok(Continue)` when satisfied, otherwise the first branch's typed error, falling back to `OrkaError::FanOutPolicyUnmet` when the policy is unmet with no branch failure (`RequireAll` over branches that all stopped).
-    *   `Display`: `"5 item(s): 3 succeeded, 1 failed, 1 not started (RequireAll: unmet)"`
+    *   `into_first_error(self) -> Option<Err>` and `into_control(self) -> Result<PipelineControl, Err>` (consuming, since `Err` need not be `Clone`; read what you need first). `into_control` returns `Ok(Stop)` when `was_cancelled()`, `Ok(Continue)` when satisfied, otherwise the first branch's typed error, falling back to `OrkaError::FanOutPolicyUnmet` when the policy is unmet with no branch failure (`RequireAll` over branches that all stopped).
+    *   A cancelled fan-out is **unmet under every built-in policy**, `CollectAll` included: "run everything and always report satisfied" is a claim about a fan-out that was allowed to run everything.
+    *   `Display`: `"5 item(s): 3 succeeded, 1 failed, 0 cancelled, 1 not started (RequireAll: unmet)"`
+
+## 10. Cancellation (out-of-band)
+
+`PipelineControl::Stop` is **in-band**: only the handler currently executing can end a run. A `CancelToken` is the out-of-band counterpart, for anything that is not the running handler: an operator's Ctrl-C, a supervising task, a parent run winding down the orchestration it started.
+
+Cancellation is **cooperative and never preemptive**. Setting a token stops new work from starting; it does not drop an in-flight handler future. This is the same invariant `FanOutPolicy::FailFast` keeps, promoted to a first-class concept.
+
+### Struct `orka::CancelToken`
+
+`Clone + Default + Debug`. Cheap to clone (one `Arc`). Every `ContextData` carries one.
+
+*   **`pub fn new() -> Self`**
+*   **`pub fn cancel(&self)`**: sets the token and wakes every waiter. Idempotent.
+*   **`pub fn is_cancelled(&self) -> bool`**
+*   **`pub fn cancelled(&self) -> Cancelled`**: a future that resolves once the token is cancelled, and never otherwise.
+
+### Struct `orka::Cancelled`
+
+The future returned by `CancelToken::cancelled`. Owns its token, so it is `'static` and `Send`. Hand-rolled on an `AtomicBool` and a waker vector; orka depends on no async utility crate.
+
+### Reaching it from a handler
+
+*   **`ContextData::cancellation(&self) -> CancelToken`**
+    *   Never returns `None`, so a handler never branches on whether the run is cancellable. A context that was never passed to a `run_with_cancel*` holds a token nobody can reach: `is_cancelled()` stays false and `cancelled()` never resolves.
+    *   Calling `cancel()` on it from inside a handler cancels this run.
+
+The engine polls the token at every **step boundary**, so a handler that cannot await it still gets cancellation with a latency of one step. A handler that awaits something long closes that gap itself:
+
+```rust
+tokio::select! {
+  _ = ctx.cancellation().cancelled() => Ok(PipelineControl::Stop),
+  r = orka::timed("await-completion", budget, rx.recv()) => finish(r),
+}
+```
+
+### Running with a token
+
+*   **`Pipeline::run_with_cancel(&self, ctx: ContextData<TData>, token: CancelToken) -> Result<PipelineResult, Err>`**
+*   **`Pipeline::run_with_cancel_and_outcome(...) -> (Result<PipelineResult, Err>, RunOutcome)`**
+*   **`Pipeline::run_with_observer_and_cancel(&self, ctx, observer: Arc<dyn PipelineObserver>, token) -> (Result<PipelineResult, Err>, RunOutcome)`**
+*   **`Orka::run_with_cancel<TData>(&self, ctx, token) -> Result<PipelineResult, ApplicationError>`**
+*   **`Orka::run_with_cancel_and_outcome<TData>(&self, ctx, token) -> (Result<PipelineResult, ApplicationError>, RunOutcome)`**
+
+The token is installed **into the context**, which is why the registry forms need no plumbing: the registry erases the context into a `Box<dyn Any + Send>` and the token rides inside it. A registration made through `Orka::register_runner` with a custom `PipelineRunner` honours the token only if its implementation reaches the core run loop.
+
+Runs started from inside a cancelled run inherit the token: fan-out branches (via `with_cancel`) and conditional sub-pipelines (automatically).
+
+### What a cancelled run does
+
+A cancelled run stops before starting its next step and then takes the **ordinary exit**: the `on_finish` ring fires in full and the resource bag releases, exactly as for a completed run. That is the whole point, and it is what a compensating finalizer depends on.
+
+*   `PipelineResult::Cancelled` and `RunOutcome::Cancelled`, rather than folding into `Stopped`. A finalizer deciding whether to discard a half-built artifact needs to tell a deliberate early exit from an interrupted one.
+*   `TraceEventKind::RunCancelled { step, index }` names the step the run was about to start, which is the post-mortem answer to how far it got. `RunFinished { outcome: Cancelled }` follows, after the finalizers.
+*   `PlannedAction::Cancelled`: `resolve_plan` against an already-cancelled context plans every step as this, since a run would wind down at its first boundary.
+
+**Cancellation during the finish ring is ignored.** The ring is the cleanup a cancelled run exists to reach; interrupting it would strand exactly the drains, locks and half-built artifacts a finalizer is there to unwind. This is an invariant, not an oversight.
+
+A handler returning `Stop` while the token is set reports as `Cancelled`: the token's verdict outranks the control signal. The cost is that a handler stopping for its own unrelated reasons during a cancellation loses that identity in the outcome.
+
+### `FanOut::with_cancel(self, token: CancelToken) -> Self`
+
+Stops new branches from starting, exactly as `FailFast` does on a failure, and drains in-flight ones. The token is also installed into every branch's context, so each branch's own run winds down at its next step boundary and still fires its `on_finish` ring.
+
+Read `not_started()` against `cancelled()` when a branch registers work that outlives it: an interrupted branch has state to tear down, one that never started does not.
+
+Passing the enclosing run's own token (`ctx.cancellation()`) is the usual call, and is what makes cancelling a parent cancel the orchestration it started.
+
+### What this does not solve
+
+A handler that blocks the thread, or awaits something with no cancel arm, still runs to completion. Cancellation bounds *starting* work, not *finishing* it. Orka has no timer and imposes no timeouts; see `orka::timed` for a hard bound on a single await.

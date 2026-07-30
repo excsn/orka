@@ -75,7 +75,7 @@ where
   ///   .skip_if("validate", |ctx| ctx.read().already_valid);
   /// ```
   ///
-  /// Accepts anything iterable of string-likes — `&["a", "b"]`, `["a", "b"]`, `Vec<String>`.
+  /// Accepts anything iterable of string-likes: `&["a", "b"]`, `["a", "b"]`, `Vec<String>`.
   ///
   /// # Panics
   /// Panics if the same step name appears twice.
@@ -449,7 +449,7 @@ where
   /// (or, worse, silently do nothing).
   ///
   /// Reports:
-  /// 1. A required step with no `before`/`on`/`after` handlers — this fails at run time
+  /// 1. A required step with no `before`/`on`/`after` handlers, which fails at run time
   ///    with [`OrkaError::HandlerMissing`]; `validate` surfaces it at setup instead.
   /// 2. An extractor registered for a step that has no `on::<SData>` handler using it.
   /// 3. A `conditional_scopes_for_step` builder that was never finalized, so its scopes
@@ -641,7 +641,7 @@ where
   /// The step is created if it does not already exist.
   ///
   /// You **must** terminate the returned chain with
-  /// [`finalize_conditional_step`](ConditionalScopeBuilder::finalize_conditional_step) —
+  /// [`finalize_conditional_step`](ConditionalScopeBuilder::finalize_conditional_step):
   /// otherwise the configured scopes are discarded. [`validate`](Self::validate) reports
   /// this if you forget.
   pub fn conditional_scopes_for_step(&mut self, step_name: impl AsRef<str>) -> ConditionalScopeBuilder<'_, TData, Err> {

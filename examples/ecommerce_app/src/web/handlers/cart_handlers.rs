@@ -92,6 +92,15 @@ pub async fn add_to_cart_handler(
         "Process to add item to cart was halted.".to_string(),
       ))
     }
+    Ok(other) => {
+      warn!(
+        "Add to Cart pipeline for user {} ended as {:?}.",
+        auth_user.user_id, other
+      );
+      Err(AppError::Internal(
+        "Process to add item to cart did not run to completion.".to_string(),
+      ))
+    }
     Err(app_err) => {
       warn!(
         "Add to Cart pipeline failed for user {}: {:?}",

@@ -40,6 +40,7 @@ where
     let outcome = match &result {
       Ok(PipelineResult::Completed) => RunOutcome::Completed,
       Ok(PipelineResult::Stopped) => RunOutcome::Stopped,
+      Ok(PipelineResult::Cancelled) => RunOutcome::Cancelled,
       Err(e) => RunOutcome::Errored {
         step: String::new(),
         message: e.to_string(),

@@ -12,9 +12,18 @@ pub enum PipelineControl {
 
 /// Outcome of a full pipeline execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PipelineResult {
   /// The pipeline executed all its non-skipped, non-optional steps to completion.
   Completed,
   /// The pipeline was explicitly stopped by a handler returning `PipelineControl::Stop`.
   Stopped,
+  /// The pipeline reached a step boundary with its
+  /// [`CancelToken`](crate::CancelToken) set and wound down without starting that step.
+  ///
+  /// Distinct from [`Stopped`](Self::Stopped) because the two want opposite cleanup: a
+  /// stop is a deliberate early exit, a cancellation leaves whatever the run had half
+  /// built. A handler returning `Stop` while the token is set reports as this, since the
+  /// token's verdict outranks the handler's.
+  Cancelled,
 }

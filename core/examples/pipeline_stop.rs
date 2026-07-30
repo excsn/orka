@@ -53,6 +53,9 @@ async fn main() -> Result<(), OrkaError> {
     PipelineResult::Stopped => {
       info!("Pipeline stopped as expected.");
     }
+    other => {
+      error!("Pipeline ended as {:?}, but was expected to stop!", other);
+    }
   }
 
   let final_state = initial_context.read();

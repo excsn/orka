@@ -20,7 +20,7 @@ async fn test_pipeline_run_catches_handler_missing() {
 
 // Extractor and provider failure variants are covered in conditional_scope_tests.rs.
 
-/// A pipeline whose handler error type is `OrkaError` itself — the zero-friction path.
+/// A pipeline whose handler error type is `OrkaError` itself, the zero-friction path.
 #[tokio::test]
 async fn test_pipeline_with_orka_error_type() {
   setup_tracing();

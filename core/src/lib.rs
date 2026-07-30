@@ -9,6 +9,7 @@
 //!  - Per-step extractors for operating on sub-contexts.
 //!  - Conditional execution of scoped pipelines, allowing dynamic workflow branching.
 //!  - A type-keyed registry for managing and running different pipelines.
+//!  - Out-of-band cancellation that winds a run down through its normal exit.
 
 pub mod core;
 pub mod pipeline;
@@ -19,6 +20,7 @@ pub mod error;
 #[cfg(feature = "tokio")]
 pub mod time;
 
+pub use crate::core::cancel::{CancelToken, Cancelled};
 pub use crate::core::control::{PipelineControl, PipelineResult};
 pub use crate::core::step::{SkipCondition, StepDef};
 pub use crate::core::context::{AnyContextDataExtractor, ContextDataExtractorImpl, FinishHandler, Handler};
@@ -65,8 +67,9 @@ pub mod test_util;
 /// build/configure/run/inspect surface. That covers the parameter and return types of
 /// `Pipeline`'s own methods: [`RunOutcome`] for [`on_finish`](Pipeline::on_finish) and
 /// [`run_with_outcome`](Pipeline::run_with_outcome), [`StepPlan`] / [`PlannedAction`] /
-/// [`SkipReason`] for [`resolve_plan`](Pipeline::resolve_plan), and [`StepPhase`] for
-/// [`has_handlers`](Pipeline::has_handlers).
+/// [`SkipReason`] for [`resolve_plan`](Pipeline::resolve_plan), [`StepPhase`] for
+/// [`has_handlers`](Pipeline::has_handlers), and [`CancelToken`] / [`Cancelled`] for
+/// [`run_with_cancel`](Pipeline::run_with_cancel).
 ///
 /// Two clusters are deliberately left out, because you reach for them on purpose rather
 /// than meeting them in a signature: the **advanced** surface (`Handler`,
@@ -75,6 +78,7 @@ pub mod test_util;
 /// `PipelineObserver`, `CompositeObserver`, `TraceEvent`, `TraceEventKind`,
 /// `HandlerOutcome`, `RunTrace`). Import those from the crate root.
 pub mod prelude {
+  pub use crate::core::cancel::{CancelToken, Cancelled};
   pub use crate::core::context_data::ContextData;
   pub use crate::core::control::{PipelineControl, PipelineResult};
   pub use crate::core::step::{SkipCondition, StepDef};

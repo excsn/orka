@@ -353,7 +353,7 @@ where
   ///   });
   /// ```
   ///
-  /// The merge runs **only when the handler returns `Ok`** — a failed sub-handler leaves
+  /// The merge runs **only when the handler returns `Ok`**; a failed sub-handler leaves
   /// the root context untouched.
   ///
   /// # Panics
@@ -375,7 +375,7 @@ where
 
   /// Registers an `on` hook that operates on the step's extracted `ContextData<SData>`.
   ///
-  /// Annotate the closure parameter (`|sub: ContextData<MyType>|`) — that is what tells
+  /// Annotate the closure parameter (`|sub: ContextData<MyType>|`): that is what tells
   /// Orka which `SData` you mean.
   ///
   /// # Panics

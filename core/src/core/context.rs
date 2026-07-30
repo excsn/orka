@@ -60,7 +60,7 @@ pub trait AnyContextDataExtractor<TData: 'static + Send + Sync>: Send + Sync {
   /// registered without a merge function treat this as a no-op, preserving the historical
   /// "the sub-handler works on a detached copy" semantics.
   ///
-  /// Callers must not hold any lock guard when invoking this — it takes a read lock on the
+  /// Callers must not hold any lock guard when invoking this, since it takes a read lock on the
   /// sub-context and a write lock on the root.
   fn merge_sub_context_data(
     &self,

@@ -3,6 +3,7 @@
 //!
 //! The pipeline is `Pipeline<TData, Err>`, and `run` returns `Result<PipelineResult, Err>`.
 
+use crate::core::cancel::CancelToken;
 use crate::core::context_data::ContextData;
 use crate::core::control::{PipelineControl, PipelineResult};
 use crate::core::step::StepDef;
@@ -23,6 +24,7 @@ use tracing::{event, instrument, span, Level};
 /// What [`Pipeline::resolve_plan`] predicts for one step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
 pub enum PlannedAction {
   /// The step would execute its handlers.
   Run,
@@ -31,6 +33,9 @@ pub enum PlannedAction {
   /// The step is required but has no handlers: `run` would fail with
   /// [`OrkaError::HandlerMissing`] here.
   FailMissingHandlers,
+  /// The context's [`CancelToken`](crate::CancelToken) is already set, so a run against it
+  /// would wind down at its first step boundary and reach nothing.
+  Cancelled,
 }
 
 impl fmt::Display for PlannedAction {
@@ -39,6 +44,7 @@ impl fmt::Display for PlannedAction {
       PlannedAction::Run => write!(f, "run"),
       PlannedAction::Skip(reason) => write!(f, "skip ({})", reason),
       PlannedAction::FailMissingHandlers => write!(f, "fail (required step has no handlers)"),
+      PlannedAction::Cancelled => write!(f, "cancelled"),
     }
   }
 }
@@ -143,6 +149,58 @@ where
     self.run_with_observer_inner(ctx_data, Some(observer)).await
   }
 
+  /// As [`run`](Self::run), with a [`CancelToken`] a caller outside the run can set to wind
+  /// it down.
+  ///
+  /// [`PipelineControl::Stop`] is in-band, so only the handler currently executing can end
+  /// a run. This is the out-of-band counterpart: an operator's Ctrl-C, a supervising task,
+  /// a parent run cancelling a fan-out branch.
+  ///
+  /// The token is checked at every step boundary. A cancelled run stops before starting
+  /// its next step, then takes the ordinary exit: the [`on_finish`](Self::on_finish) ring
+  /// fires in full and the [`resources`](ContextData::resources) bag releases, exactly as
+  /// for a completed run. Nothing in flight is dropped, so a handler already awaiting runs
+  /// to its own end; give it [`CancelToken::cancelled`] to race against if that wait is
+  /// long.
+  ///
+  /// The token is installed into `ctx_data`, so every handler reaches it through
+  /// [`ContextData::cancellation`] and every run started from inside (fan-out branches,
+  /// conditional scopes) inherits it.
+  pub async fn run_with_cancel(
+    &self,
+    ctx_data: ContextData<TData>,
+    token: CancelToken,
+  ) -> Result<PipelineResult, Err> {
+    self.run_with_cancel_and_outcome(ctx_data, token).await.0
+  }
+
+  /// As [`run_with_cancel`](Self::run_with_cancel), but also returns the [`RunOutcome`],
+  /// which reports [`RunOutcome::Cancelled`] rather than folding into
+  /// [`Stopped`](RunOutcome::Stopped).
+  ///
+  /// That distinction is the point of the variant: a finalizer deciding whether to discard
+  /// a half-built artifact needs to tell a deliberate early exit from an interrupted one.
+  pub async fn run_with_cancel_and_outcome(
+    &self,
+    ctx_data: ContextData<TData>,
+    token: CancelToken,
+  ) -> (Result<PipelineResult, Err>, RunOutcome) {
+    ctx_data.install_cancellation(token);
+    self.run_with_observer_inner(ctx_data, None).await
+  }
+
+  /// [`run_with_observer`](Self::run_with_observer) and
+  /// [`run_with_cancel`](Self::run_with_cancel) together.
+  pub async fn run_with_observer_and_cancel(
+    &self,
+    ctx_data: ContextData<TData>,
+    observer: Arc<dyn PipelineObserver>,
+    token: CancelToken,
+  ) -> (Result<PipelineResult, Err>, RunOutcome) {
+    ctx_data.install_cancellation(token);
+    self.run_with_observer_inner(ctx_data, Some(observer)).await
+  }
+
   async fn run_with_observer_inner(
     &self,
     ctx_data: ContextData<TData>,
@@ -160,6 +218,7 @@ where
     let outcome = match &result {
       Ok(PipelineResult::Completed) => RunOutcome::Completed,
       Ok(PipelineResult::Stopped) => RunOutcome::Stopped,
+      Ok(PipelineResult::Cancelled) => RunOutcome::Cancelled,
       Err((step, e)) => RunOutcome::Errored {
         step: step.clone(),
         message: e.to_string(),
@@ -170,6 +229,10 @@ where
     // fails. On an Ok run (Completed or Stopped) the first finish-handler error becomes
     // the run's error; on an already-failed run, finish-handler errors are logged and the
     // original error is preserved.
+    //
+    // The ring is deliberately not cancellable: it is the cleanup a cancelled run exists
+    // to reach, and interrupting it would strand exactly the drains, locks and half-built
+    // artifacts a finalizer is there to unwind.
     let mut finish_error: Option<Err> = None;
     for (handler_index, finish_handler) in self.finish_handlers.iter().enumerate() {
       match finish_handler(ctx_data.clone(), outcome.clone()).await {
@@ -227,6 +290,7 @@ where
     let final_outcome = match &final_result {
       Ok(PipelineResult::Completed) => RunOutcome::Completed,
       Ok(PipelineResult::Stopped) => RunOutcome::Stopped,
+      Ok(PipelineResult::Cancelled) => RunOutcome::Cancelled,
       Err((step, e)) => RunOutcome::Errored {
         step: step.clone(),
         message: e.to_string(),
@@ -318,12 +382,20 @@ where
   /// step-to-step data flow (a step that sets a flag a later predicate reads) is not
   /// simulated, which is exactly why this fits seeded table tests and serves only as a
   /// preview in production.
+  ///
+  /// A context whose [`CancelToken`](ContextData::cancellation) is already set plans every
+  /// step as [`PlannedAction::Cancelled`], since a run against it would wind down at its
+  /// first boundary.
   pub fn resolve_plan(&self, ctx_data: &ContextData<TData>) -> Vec<StepPlan> {
+    let cancelled = ctx_data.cancellation().is_cancelled();
+
     self
       .steps
       .iter()
       .map(|step_def| {
-        let action = if step_def
+        let action = if cancelled {
+          PlannedAction::Cancelled
+        } else if step_def
           .skip_if
           .as_ref()
           .is_some_and(|cond| cond(ctx_data.clone()))
@@ -394,9 +466,24 @@ where
     observer: Option<&Arc<dyn PipelineObserver>>,
     scoped: Option<Arc<dyn PipelineObserver>>,
   ) -> Result<PipelineResult, (String, Err)> {
+    let cancel = ctx_data.cancellation();
+
     for (slice_idx, step_def) in steps.iter().enumerate() {
       let step_idx = index_offset + slice_idx;
       let step_name_str = step_def.name.as_str();
+
+      if cancel.is_cancelled() {
+        event!(Level::INFO, step = step_name_str, "Run cancelled at step boundary.");
+        emit(
+          observer,
+          run_id,
+          TraceEventKind::RunCancelled {
+            step: step_def.name.clone(),
+            index: step_idx,
+          },
+        );
+        return Ok(PipelineResult::Cancelled);
+      }
 
       let step_span = span!(
         Level::INFO,
@@ -508,6 +595,21 @@ where
                   outcome: HandlerOutcome::Stop,
                 },
               );
+              // A handler that notices cancellation says so by returning Stop, so the
+              // token's verdict outranks the control signal here. The cost is that a
+              // handler stopping for its own unrelated reasons during a cancellation
+              // reports as cancelled too.
+              if cancel.is_cancelled() {
+                emit(
+                  observer,
+                  run_id,
+                  TraceEventKind::RunCancelled {
+                    step: step_def.name.clone(),
+                    index: step_idx,
+                  },
+                );
+                return Ok(PipelineResult::Cancelled);
+              }
               return Ok(PipelineResult::Stopped);
             }
             Err(e) => {

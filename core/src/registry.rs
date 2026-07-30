@@ -2,6 +2,7 @@
 //! Pipelines are `crate::pipeline::definition::Pipeline<TData, PipelineHandlerError>`.
 //! The registry returns results with an application-level error type `E`.
 
+use crate::core::cancel::CancelToken;
 use crate::core::control::PipelineResult;
 use crate::core::context_data::ContextData;
 use crate::core::trace::RunOutcome;
@@ -322,6 +323,44 @@ where
 
     let owned_ctx_obj: Box<dyn Any + Send> = Box::new(ctx_data.clone());
     runner_arc.run_any_erased_detailed(owned_ctx_obj).await
+  }
+
+  /// As [`run`](Self::run), with a [`CancelToken`] a caller outside the run can set to wind
+  /// it down at its next step boundary. See
+  /// [`Pipeline::run_with_cancel`](crate::Pipeline::run_with_cancel) for the semantics: the
+  /// `on_finish` ring still fires and the resource bag still releases, and nothing in
+  /// flight is dropped.
+  ///
+  /// The token travels inside `ctx_data`, so it survives this registry's type erasure with
+  /// no plumbing. The exception is a registration made through
+  /// [`register_runner`](Self::register_runner) whose [`PipelineRunner`](crate::PipelineRunner)
+  /// does not delegate to a core `Pipeline`: such a runner sees the token only if it reads
+  /// it from the context itself.
+  pub async fn run_with_cancel<TData>(
+    &self,
+    ctx_data: ContextData<TData>,
+    token: CancelToken,
+  ) -> Result<PipelineResult, ApplicationError>
+  where
+    TData: 'static + Send + Sync,
+  {
+    ctx_data.install_cancellation(token);
+    self.run(ctx_data).await
+  }
+
+  /// As [`run_with_cancel`](Self::run_with_cancel), but also returns the [`RunOutcome`],
+  /// which reports [`RunOutcome::Cancelled`] rather than folding into
+  /// [`Stopped`](RunOutcome::Stopped).
+  pub async fn run_with_cancel_and_outcome<TData>(
+    &self,
+    ctx_data: ContextData<TData>,
+    token: CancelToken,
+  ) -> (Result<PipelineResult, ApplicationError>, RunOutcome)
+  where
+    TData: 'static + Send + Sync,
+  {
+    ctx_data.install_cancellation(token);
+    self.run_with_outcome(ctx_data).await
   }
 }
 

@@ -164,7 +164,7 @@ async fn main() -> Result<(), OrkaError> {
   }
 
   // --- Scenario 2: `set_extractor_with_merge` folds the sub-context back in ---
-  // Same handlers, same sub-context — the only difference is the merge function, which
+  // Same handlers, same sub-context; the only difference is the merge function, which
   // runs after the sub-handler succeeds and copies its work into the root context.
   info!("\n--- Scenario 2: extractor with merge (writes land in the parent) ---");
   let merging_pipeline = build_order_pipeline(true);

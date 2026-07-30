@@ -1,3 +1,4 @@
+use crate::core::cancel::CancelToken;
 use crate::core::resources::RunResources;
 use crate::error::OrkaError;
 use parking_lot::{
@@ -11,10 +12,11 @@ use std::fmt;
 use std::sync::Arc;
 
 /// The shared state behind a `ContextData`: the workflow's data, plus the run-scoped
-/// resources it is holding.
+/// resources it is holding and the token that can wind the run down.
 struct Inner<T: Send + Sync + 'static> {
   data: RwLock<T>,
   resources: RunResources,
+  cancel: RwLock<CancelToken>,
 }
 
 /// A wrapper for context data providing shared ownership and interior mutability
@@ -26,7 +28,8 @@ struct Inner<T: Send + Sync + 'static> {
 ///
 /// Alongside the data, each context carries a [`RunResources`] bag for RAII values the run
 /// must hold but does not operate on (lock guards, temp dirs); see
-/// [`resources`](Self::resources).
+/// [`resources`](Self::resources). It also carries the run's
+/// [`CancelToken`](Self::cancellation).
 pub struct ContextData<T: Send + Sync + 'static>(Arc<Inner<T>>);
 
 impl<T: Send + Sync + 'static> ContextData<T> {
@@ -34,6 +37,7 @@ impl<T: Send + Sync + 'static> ContextData<T> {
     ContextData(Arc::new(Inner {
       data: RwLock::new(data),
       resources: RunResources::new(),
+      cancel: RwLock::new(CancelToken::new()),
     }))
   }
 
@@ -51,6 +55,34 @@ impl<T: Send + Sync + 'static> ContextData<T> {
   /// for the full lifecycle, including what the partial runners do.
   pub fn resources(&self) -> &RunResources {
     &self.0.resources
+  }
+
+  /// The run's cancellation token, shared by every handle to this context.
+  ///
+  /// A context always has one, so this never returns `None` and a handler never has to
+  /// branch on whether the run is cancellable. A context that was never passed to
+  /// [`run_with_cancel`](crate::Pipeline::run_with_cancel) holds a token nobody can reach,
+  /// so [`is_cancelled`](CancelToken::is_cancelled) stays false and
+  /// [`cancelled`](CancelToken::cancelled) never resolves:
+  ///
+  /// ```ignore
+  /// tokio::select! {
+  ///   _ = ctx.cancellation().cancelled() => Ok(PipelineControl::Stop),
+  ///   r = timed("await-completion", budget, rx.recv()) => finish(r),
+  /// }
+  /// ```
+  ///
+  /// The engine also polls it at every step boundary, so a handler that cannot await it
+  /// still gets cancellation with a latency of one step. Calling
+  /// [`cancel`](CancelToken::cancel) on it from inside a handler cancels this run.
+  pub fn cancellation(&self) -> CancelToken {
+    self.0.cancel.read().clone()
+  }
+
+  /// Replaces the run's token. Called once at the start of a cancellable run, and by
+  /// fan-out and conditional scopes to hand a child run its parent's token.
+  pub(crate) fn install_cancellation(&self, token: CancelToken) {
+    *self.0.cancel.write() = token;
   }
 
   /// Acquires a read lock. Panics if the RwLock is poisoned.
@@ -175,7 +207,7 @@ impl<T: Send + Sync + 'static> ContextData<T> {
   /// pipeline.set_extractor("validate", |main| Ok(main.project(|d| d.customer.clone())));
   /// ```
   ///
-  /// The result does **not** share state with `self` — writes to it are not visible here.
+  /// The result does **not** share state with `self`: writes to it are not visible here.
   /// To propagate them back, pair the extractor with a merge function via
   /// [`Pipeline::set_extractor_with_merge`](crate::Pipeline::set_extractor_with_merge).
   /// It also starts with an empty [`resources`](Self::resources) bag of its own.
@@ -206,6 +238,7 @@ impl<T: Send + Sync + 'static + fmt::Debug> fmt::Debug for ContextData<T> {
     f.debug_struct("ContextData")
       .field("data", &self.0.data)
       .field("resources", &self.0.resources)
+      .field("cancel", &*self.0.cancel.read())
       .finish()
   }
 }

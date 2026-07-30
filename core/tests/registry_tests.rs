@@ -4,8 +4,8 @@ mod common;
 use common::*;
 use orka::test_util::MockPipeline;
 use orka::{
-  ContextData, Orka, OrkaError, Pipeline, PipelineControl, PipelineResult, PlannedAction, RunOutcome, SkipReason,
-  TraceCollector, TraceEventKind,
+  CancelToken, ContextData, Orka, OrkaError, Pipeline, PipelineControl, PipelineResult, PlannedAction, RunOutcome,
+  SkipReason, TraceCollector, TraceEventKind,
 };
 use std::sync::Arc;
 
@@ -207,4 +207,56 @@ async fn observe_and_dry_run_the_registered_pipeline_through_the_front_door() {
   let step_ctx = ContextData::new(RegistryContextAlpha::default());
   p.run_step("commit", step_ctx.clone()).await.unwrap();
   assert_eq!(step_ctx.read().val, "committed;");
+}
+
+/// The registry boxes the context into `Box<dyn Any + Send>` to erase its type. The token
+/// rides inside that context rather than alongside it, so cancellation reaches a
+/// registry-driven run with no plumbing in the erasure path.
+#[tokio::test]
+async fn cancellation_survives_the_registry_type_erasure() {
+  setup_tracing();
+  let orka_registry = Orka::<TestError>::new();
+  let token = CancelToken::new();
+
+  let canceller = token.clone();
+  let mut p = Pipeline::<RegistryContextAlpha, TestError>::new(["first", "second"]);
+  p.on_root("first", move |ctx: ContextData<RegistryContextAlpha>| {
+    let canceller = canceller.clone();
+    async move {
+      ctx.write().val = "first".to_string();
+      canceller.cancel();
+      Ok(PipelineControl::Continue)
+    }
+  })
+  .on_root("second", |ctx: ContextData<RegistryContextAlpha>| async move {
+    ctx.write().val = "second".to_string();
+    Ok(PipelineControl::Continue)
+  });
+  orka_registry.register_pipeline(p).unwrap();
+
+  let ctx = ContextData::new(RegistryContextAlpha::default());
+  let (result, outcome) = orka_registry.run_with_cancel_and_outcome(ctx.clone(), token).await;
+
+  assert_eq!(result.unwrap(), PipelineResult::Cancelled);
+  assert_eq!(outcome, RunOutcome::Cancelled);
+  assert_eq!(ctx.read().val, "first", "the second step never ran");
+}
+
+#[tokio::test]
+async fn a_registry_run_with_an_uncancelled_token_completes_normally() {
+  setup_tracing();
+  let orka_registry = Orka::<TestError>::new();
+
+  let mut p = Pipeline::<RegistryContextBeta, TestError>::new(["task"]);
+  p.on_root("task", |ctx: ContextData<RegistryContextBeta>| async move {
+    ctx.write().num = 7;
+    Ok(PipelineControl::Continue)
+  });
+  orka_registry.register_pipeline(p).unwrap();
+
+  let ctx = ContextData::new(RegistryContextBeta::default());
+  let result = orka_registry.run_with_cancel(ctx.clone(), CancelToken::new()).await;
+
+  assert_eq!(result.unwrap(), PipelineResult::Completed);
+  assert_eq!(ctx.read().num, 7);
 }

@@ -19,6 +19,7 @@
 pub(crate) mod joiner;
 pub mod spawner;
 
+use crate::core::cancel::CancelToken;
 use crate::core::context_data::ContextData;
 use crate::core::control::{PipelineControl, PipelineResult};
 use crate::error::OrkaError;
@@ -33,10 +34,12 @@ use std::sync::Arc;
 ///
 /// [`FailFast`](Self::FailFast) is the only policy that can act before every branch has
 /// settled, because it is the only one whose verdict is knowable early. It stops *starting*
-/// new branches and lets in-flight ones finish rather than cancelling them: a cancelled
-/// branch would be a dropped mid-run pipeline, whose
-/// [`on_finish`](crate::Pipeline::on_finish) handlers would never fire and whose resource
-/// bag would release late.
+/// new branches and lets in-flight ones finish rather than dropping them mid-run, which
+/// would leave their [`on_finish`](crate::Pipeline::on_finish) handlers unfired and their
+/// resource bags to release late.
+///
+/// [`FanOut::with_cancel`] is that same behaviour reached from outside instead of from a
+/// branch failure, and it composes with every policy rather than only this one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FanOutPolicy {
   /// Stop starting new branches after the first failure, drain the in-flight ones, and
@@ -72,6 +75,7 @@ where
 }
 
 /// How one branch ended.
+#[non_exhaustive]
 pub enum FanOutItemOutcome<Err> {
   /// The branch ran without error. Carries whether its pipeline completed or was stopped
   /// by one of its own handlers.
@@ -79,8 +83,16 @@ pub enum FanOutItemOutcome<Err> {
   /// The branch failed. The error is the branch's own typed `Err`, not a string: each is
   /// produced once and owned, so nothing is lost aggregating them.
   Failed(Err),
-  /// The branch never started, because [`FanOutPolicy::FailFast`] tripped first. It has
-  /// run no code at all, and its context still holds the untouched input.
+  /// The branch started and was interrupted mid-run by [`FanOut::with_cancel`]. Whatever
+  /// it had done by then is done, and its context holds it.
+  ///
+  /// Distinct from [`NotStarted`](Self::NotStarted) because the two need opposite
+  /// follow-up: an interrupted branch may have registered work on a remote side that has
+  /// to be torn down, where one that never started has nothing to tear down.
+  Cancelled,
+  /// The branch never started, because [`FanOutPolicy::FailFast`] or a cancellation
+  /// tripped first. It has run no code at all, and its context still holds the untouched
+  /// input.
   NotStarted,
 }
 
@@ -93,6 +105,10 @@ impl<Err> FanOutItemOutcome<Err> {
     matches!(self, FanOutItemOutcome::Failed(_))
   }
 
+  pub fn is_cancelled(&self) -> bool {
+    matches!(self, FanOutItemOutcome::Cancelled)
+  }
+
   pub fn is_not_started(&self) -> bool {
     matches!(self, FanOutItemOutcome::NotStarted)
   }
@@ -103,6 +119,7 @@ impl<Err: fmt::Debug> fmt::Debug for FanOutItemOutcome<Err> {
     match self {
       FanOutItemOutcome::Completed(r) => f.debug_tuple("Completed").field(r).finish(),
       FanOutItemOutcome::Failed(e) => f.debug_tuple("Failed").field(e).finish(),
+      FanOutItemOutcome::Cancelled => write!(f, "Cancelled"),
       FanOutItemOutcome::NotStarted => write!(f, "NotStarted"),
     }
   }
@@ -131,6 +148,7 @@ where
   items: Vec<FanOutItem<SData, Err>>,
   policy: FanOutPolicy,
   satisfied: bool,
+  cancelled: bool,
 }
 
 impl<SData, Err> FanOutResults<SData, Err>
@@ -168,8 +186,27 @@ where
       .count()
   }
 
+  /// Branches that started and were interrupted mid-run.
+  ///
+  /// Read this against [`not_started`](Self::not_started) when a branch registers work
+  /// somewhere that outlives it: an interrupted branch has state to tear down, one that
+  /// never started does not. It is also the difference between telling an operator "3
+  /// never started" and "3 interrupted mid-run".
+  pub fn cancelled(&self) -> usize {
+    self.items.iter().filter(|i| i.outcome.is_cancelled()).count()
+  }
+
   pub fn not_started(&self) -> usize {
     self.items.iter().filter(|i| i.outcome.is_not_started()).count()
+  }
+
+  /// Whether this fan-out's [`CancelToken`](FanOut::with_cancel) fired.
+  ///
+  /// Separate from [`cancelled`](Self::cancelled) being non-zero: a fan-out cancelled
+  /// before any branch started has zero cancelled branches and every branch
+  /// [`NotStarted`](FanOutItemOutcome::NotStarted).
+  pub fn was_cancelled(&self) -> bool {
+    self.cancelled
   }
 
   /// Contexts of the branches that ran without error.
@@ -220,11 +257,18 @@ where
   /// the first branch's typed error, or [`OrkaError::FanOutPolicyUnmet`] when the policy
   /// was unmet without any branch failing (`RequireAll` over branches that all stopped).
   ///
+  /// A cancelled fan-out yields `Ok(Stop)` instead of any error, since cancellation is an
+  /// outcome and not a failure. The enclosing run's own boundary check then reports it as
+  /// [`PipelineResult::Cancelled`], because parent and branches share one token.
+  ///
   /// Consumes the results, so read anything you need out of them first.
   pub fn into_control(self) -> Result<PipelineControl, Err>
   where
     Err: std::error::Error + From<OrkaError> + Send + Sync + 'static,
   {
+    if self.cancelled {
+      return Ok(PipelineControl::Stop);
+    }
     if self.satisfied {
       return Ok(PipelineControl::Continue);
     }
@@ -246,13 +290,20 @@ where
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     write!(
       f,
-      "{} item(s): {} succeeded, {} failed, {} not started ({}: {})",
+      "{} item(s): {} succeeded, {} failed, {} cancelled, {} not started ({}: {})",
       self.len(),
       self.succeeded(),
       self.failed(),
+      self.cancelled(),
       self.not_started(),
       self.policy,
-      if self.satisfied { "satisfied" } else { "unmet" }
+      if self.cancelled {
+        "cancelled"
+      } else if self.satisfied {
+        "satisfied"
+      } else {
+        "unmet"
+      }
     )
   }
 }
@@ -275,6 +326,7 @@ where
   verdict: Verdict<SData, Err>,
   max_concurrent: usize,
   spawner: Option<Arc<dyn TaskSpawner>>,
+  cancel: Option<CancelToken>,
 }
 
 impl<SData, Err> FanOut<SData, Err>
@@ -289,7 +341,27 @@ where
       verdict: Verdict::Builtin(FanOutPolicy::CollectAll),
       max_concurrent: usize::MAX,
       spawner: None,
+      cancel: None,
     }
+  }
+
+  /// Lets a caller outside the fan-out wind it down.
+  ///
+  /// Setting the token stops new branches from starting, exactly as
+  /// [`FanOutPolicy::FailFast`] does on a failure, and in-flight branches drain rather than
+  /// being dropped. The token is also installed into every branch's context, so each
+  /// branch's own run winds down at its next step boundary and still fires its
+  /// `on_finish` ring and releases its resources.
+  ///
+  /// The two halves of the result are what the caller acts on: branches that never started
+  /// report [`NotStarted`](FanOutItemOutcome::NotStarted), branches interrupted mid-run
+  /// report [`Cancelled`](FanOutItemOutcome::Cancelled).
+  ///
+  /// Passing the enclosing run's own token (`ctx.cancellation()`) is the usual call, and is
+  /// what makes cancelling a parent cancel the orchestration it started.
+  pub fn with_cancel(mut self, token: CancelToken) -> Self {
+    self.cancel = Some(token);
+    self
   }
 
   /// Runs each branch as a task on your executor instead of cooperatively on the caller's
@@ -340,6 +412,12 @@ where
   {
     let contexts: Vec<ContextData<SData>> = items.into_iter().map(ContextData::new).collect();
 
+    if let Some(token) = self.cancel.as_ref() {
+      for ctx in contexts.iter() {
+        ctx.install_cancellation(token.clone());
+      }
+    }
+
     let branches: Vec<BranchFuture<Result<PipelineResult, Err>>> = contexts
       .iter()
       .enumerate()
@@ -378,7 +456,7 @@ where
     let stop_on: Option<StopPredicate<Result<PipelineResult, Err>>> =
       fail_fast.then(|| Box::new(|r: &Result<PipelineResult, Err>| r.is_err()) as StopPredicate<_>);
 
-    let outcomes = BoundedJoin::new(branches, self.max_concurrent, stop_on).await;
+    let outcomes = BoundedJoin::new(branches, self.max_concurrent, stop_on, self.cancel.clone()).await;
 
     let items: Vec<FanOutItem<SData, Err>> = contexts
       .into_iter()
@@ -386,6 +464,7 @@ where
       .enumerate()
       .map(|(index, (context, outcome))| {
         let outcome = match outcome {
+          Some(Ok(PipelineResult::Cancelled)) => FanOutItemOutcome::Cancelled,
           Some(Ok(result)) => FanOutItemOutcome::Completed(result),
           Some(Err(e)) => FanOutItemOutcome::Failed(e),
           None => FanOutItemOutcome::NotStarted,
@@ -401,19 +480,26 @@ where
       Verdict::Custom(_) => FanOutPolicy::CollectAll,
     };
 
+    let cancelled = self.cancel.as_ref().is_some_and(|c| c.is_cancelled());
+
     let mut results = FanOutResults {
       items,
       policy,
       satisfied: false,
+      cancelled,
     };
 
-    results.satisfied = match &self.verdict {
-      Verdict::Builtin(FanOutPolicy::CollectAll) => true,
-      Verdict::Builtin(FanOutPolicy::FailFast) => results.failed() == 0,
-      Verdict::Builtin(FanOutPolicy::RequireAll) => results.succeeded() == results.len(),
-      Verdict::Builtin(FanOutPolicy::RequireAtLeast(n)) => results.succeeded() >= *n,
-      Verdict::Custom(is_satisfied) => is_satisfied(&results),
-    };
+    // A cancelled fan-out is unmet under every policy, `CollectAll` included: "run
+    // everything and always report satisfied" is a claim about a fan-out that was allowed
+    // to run everything.
+    results.satisfied = !cancelled
+      && match &self.verdict {
+        Verdict::Builtin(FanOutPolicy::CollectAll) => true,
+        Verdict::Builtin(FanOutPolicy::FailFast) => results.failed() == 0,
+        Verdict::Builtin(FanOutPolicy::RequireAll) => results.succeeded() == results.len(),
+        Verdict::Builtin(FanOutPolicy::RequireAtLeast(n)) => results.succeeded() >= *n,
+        Verdict::Custom(is_satisfied) => is_satisfied(&results),
+      };
 
     results
   }

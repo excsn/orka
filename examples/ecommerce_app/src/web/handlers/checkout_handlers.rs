@@ -80,6 +80,15 @@ pub async fn start_checkout_handler(
         ))
       }
     }
+    Ok(other) => {
+      warn!(
+        "Checkout pipeline for user {} ended as {:?}.",
+        auth_user.user_id, other
+      );
+      Err(AppError::Internal(
+        "Checkout process did not run to completion.".to_string(),
+      ))
+    }
     Err(app_err) => {
       warn!("Checkout pipeline failed for user {}: {:?}", auth_user.user_id, app_err);
       Err(app_err)

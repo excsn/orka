@@ -87,9 +87,14 @@ impl fmt::Display for HandlerOutcome {
 /// [`TraceEventKind::RunFinished`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[non_exhaustive]
 pub enum RunOutcome {
   Completed,
   Stopped,
+  /// The run's [`CancelToken`](crate::CancelToken) was set and it wound down at a step
+  /// boundary. A finalizer that compensates a half-applied change wants this apart from
+  /// [`Stopped`](Self::Stopped): a stop finished on purpose, a cancellation did not.
+  Cancelled,
   Errored { step: String, message: String },
 }
 
@@ -98,6 +103,7 @@ impl fmt::Display for RunOutcome {
     match self {
       RunOutcome::Completed => write!(f, "completed"),
       RunOutcome::Stopped => write!(f, "stopped"),
+      RunOutcome::Cancelled => write!(f, "cancelled"),
       RunOutcome::Errored { step, message } => write!(f, "errored at '{}': {}", step, message),
     }
   }
@@ -136,6 +142,10 @@ pub enum TraceEventKind {
     handler_index: usize,
     outcome: HandlerOutcome,
   },
+  /// The run reached a step boundary with its cancellation token set and wound down.
+  /// `step` is the step it was about to start, which is the post-mortem answer to how far
+  /// it got. The finish handlers and resource release still follow.
+  RunCancelled { step: String, index: usize },
   /// Run-scoped resources were released, after the finish handlers. Emitted only when the
   /// bag was non-empty, so traces of pipelines that hold nothing are unchanged.
   ResourcesReleased { count: usize },
@@ -164,6 +174,9 @@ impl fmt::Display for TraceEventKind {
       TraceEventKind::ScopeNotMatched { step } => write!(f, "step '{}' matched no conditional scope", step),
       TraceEventKind::FinalizerFinished { handler_index, outcome } => {
         write!(f, "finish handler #{}: {}", handler_index, outcome)
+      }
+      TraceEventKind::RunCancelled { step, index } => {
+        write!(f, "run cancelled before step '{}' (index {})", step, index)
       }
       TraceEventKind::ResourcesReleased { count } => write!(f, "released {} run-scoped resource(s)", count),
       TraceEventKind::RunFinished { outcome } => write!(f, "run finished: {}", outcome),
