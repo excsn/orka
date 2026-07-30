@@ -42,7 +42,7 @@ Import the common surface with:
 use orka::prelude::*;
 ```
 
-This brings in `Pipeline`, `PipelineRunner`, `Orka`, `ContextData`, `PipelineControl`, `PipelineResult`, `StepDef`, `SkipCondition`, `OrkaError`, `OrkaResult`, plus the types you cannot avoid naming when calling a `Pipeline` method: `RunOutcome` (for `on_finish` and `run_with_outcome`), `StepPlan`, `PlannedAction` and `SkipReason` (for `resolve_plan`), and `StepPhase` (for `has_handlers`).
+This brings in `Pipeline`, `PipelineRunner`, `Orka`, `ContextData`, `PipelineControl`, `PipelineResult`, `StepDef`, `SkipCondition`, `OrkaError`, `OrkaResult`, plus the types you cannot avoid naming when calling a `Pipeline` method: `RunOutcome` (for `on_finish` and `run_with_outcome`), `StepPlan`, `PlannedAction` and `SkipReason` (for `resolve_plan`), `StepPhase` (for `has_handlers`), and `CancelToken` / `Cancelled` (for `run_with_cancel`).
 
 Two clusters stay at the crate root, since you reach for them deliberately rather than meeting them in a signature: advanced items (`Handler`, `ContextDataExtractorImpl`, `AnyContextDataExtractor`, the pipeline providers, the conditional-scope builders) and observability (`TraceCollector`, `PipelineObserver`, `CompositeObserver`, `TraceEvent`, `TraceEventKind`, `HandlerOutcome`, `RunTrace`).
 
